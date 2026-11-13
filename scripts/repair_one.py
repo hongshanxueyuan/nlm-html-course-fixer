@@ -24,6 +24,10 @@ class RestoredRepairError(RepairError):
     pass
 
 
+class UnconfirmedRepairError(RepairError):
+    pass
+
+
 def _nlm():
     root = Path(os.environ.get("NLM_COURSE_SLIDES_ROOT", Path(__file__).resolve().parents[2] / "nlm-course-slides"))
     path = root / "scripts" / "common.py"
@@ -200,7 +204,42 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
     other_components = [x for x in _children(vertical) if x.get("category") != "imagesgallery"]
     siblings = [({"target_vertical": ids[1], "other_components": other_components} if x is vertical else x)
                 for x in _children(sequential)]
-    sibling_snapshot = hashlib.sha256(json.dumps(siblings, ensure_ascii=False, sort_keys=True,
+    def content(node):
+        if not isinstance(node, dict):
+            raise UnconfirmedRepairError("the sequential structure is incomplete")
+        kind = node.get("category")
+        identity = locator(node)
+        if kind not in {"sequential", "vertical", "html", "problem", "imagesgallery"} or not identity:
+            raise UnconfirmedRepairError("a component type cannot be checked with the available Studio reads")
+        if kind in {"sequential", "vertical"} and (
+                not isinstance(node.get("child_info"), dict)
+                or not isinstance(node["child_info"].get("children"), list)):
+            raise UnconfirmedRepairError("the sequential structure is incomplete")
+        try:
+            details = studio.get_block_details(identity)
+        except Exception as exc:
+            raise UnconfirmedRepairError("component content could not be read") from exc
+        if (not isinstance(details, dict) or details.get("id") != identity or details.get("category") != kind
+                or not isinstance(details.get("data"), str) or not isinstance(details.get("metadata"), dict)):
+            raise UnconfirmedRepairError("component content response is incomplete")
+        result = {"id": identity, "category": kind, "data": details["data"], "metadata": details["metadata"]}
+        if kind == "imagesgallery":
+            try:
+                files = _files(studio, identity)
+                audios = _retry_read(lambda: studio.get_audios(identity))
+                config = _retry_read(lambda: studio.get_play_config(identity))
+            except Exception as exc:
+                raise UnconfirmedRepairError("other Gallery state is unreadable") from exc
+            if (not isinstance(audios, dict) or not isinstance(audios.get("audios"), list)
+                    or not isinstance(config, dict) or not isinstance(config.get("play_config"), dict)):
+                raise UnconfirmedRepairError("other Gallery state is unreadable")
+            result.update({"files": files, "audios": audios["audios"], "play_config": config["play_config"]})
+        result["children"] = [content(child) for child in _children(node)
+                              if not (node is vertical and child.get("category") == "imagesgallery")]
+        return result
+
+    snapshot = {"structure": siblings, "content": content(sequential)}
+    sibling_snapshot = hashlib.sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
                                                   separators=(",", ":")).encode("utf-8")).hexdigest()
     return *ids, children, sibling_snapshot
 
@@ -622,6 +661,8 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                             "force_replace": force_replace})
     except Exception as exc:
         report["reason"] = str(exc) if isinstance(exc, RepairError) else type(exc).__name__
+        if isinstance(exc, UnconfirmedRepairError):
+            report["status"] = "unconfirmed"
         if isinstance(exc, RestoredRepairError):
             report.update({"status": "failed", "recovery": "restored and verified"})
         if replacing:

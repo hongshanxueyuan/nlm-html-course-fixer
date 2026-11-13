@@ -280,6 +280,68 @@ def test_replacement_without_confirmed_creation_identity_stays_unconfirmed(tmp_p
     assert studio.creates == 1 and studio.deleted == [] and not studio.published
 
 
+def test_replacement_resumes_confirmed_empty_gallery_before_initial_config_saved(tmp_path):
+    class InterruptedStudio(ReplacementStudio):
+        def __init__(self):
+            super().__init__()
+            self.interrupt = False
+            self.creates = 0
+
+        def create_gallery(self, vertical):
+            self.creates += 1
+            identity = super().create_gallery(vertical)
+            self.interrupt = True
+            return identity
+
+        def get_course_structure(self, course_id):
+            if self.interrupt:
+                self.interrupt = False
+                raise SystemExit("interrupted after confirmed creation")
+            return super().get_course_structure(course_id)
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = InterruptedStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    with pytest.raises(SystemExit):
+        run_batch(package, TARGET, package / "repair", **options)
+    report = run_batch(package, TARGET, package / "repair", **options)
+    assert report["sections"][0]["status"] == "success"
+    assert studio.creates == 1 and studio.deleted == [GALLERY] and studio.published
+
+
+def test_replacement_does_not_resume_if_confirmed_gallery_was_edited(tmp_path):
+    class InterruptedStudio(ReplacementStudio):
+        interrupt = False
+
+        def create_gallery(self, vertical):
+            identity = super().create_gallery(vertical)
+            self.interrupt = True
+            return identity
+
+        def get_course_structure(self, course_id):
+            if self.interrupt:
+                self.interrupt = False
+                raise SystemExit("interrupted after confirmed creation")
+            return super().get_course_structure(course_id)
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = InterruptedStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    with pytest.raises(SystemExit):
+        run_batch(package, TARGET, package / "repair", **options)
+    studio.configs[NEW_GALLERY] = {"concurrent_setting": "keep"}
+    result = run_batch(package, TARGET, package / "repair", **options)
+    assert result["sections"][0]["status"] == "unconfirmed"
+    assert studio.configs[NEW_GALLERY] == {"concurrent_setting": "keep"}
+    assert studio.uploaded_paths == [] and studio.deleted == [] and not studio.published
+
+
 def test_replacement_resumes_after_new_audio_binding_without_reupload(tmp_path):
     class InterruptedStudio(ReplacementStudio):
         def __init__(self):
@@ -545,6 +607,7 @@ def test_batch_keeps_agent_requests_isolated_and_serial(tmp_path):
             return tree
         def select(self, locator):
             return self.second if locator in (second_gallery_id, second_sequential) else self.first
+        def get_block_details(self, locator): return self.first.get_block_details(locator)
         def get_files(self, locator): return self.select(locator).get_files(locator)
         def get_audios(self, locator): return self.select(locator).get_audios(locator)
         def get_play_config(self, locator): return self.select(locator).get_play_config(locator)

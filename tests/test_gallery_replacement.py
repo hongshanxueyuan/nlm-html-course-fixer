@@ -9,18 +9,20 @@ import requests
 
 from scripts.production import Studio as RealStudio
 from scripts.repair_one import repair_one
-from test_repair_one import GALLERY, SEQUENTIAL, Studio, VERTICAL, package_at, synthesize, write_json
+from test_repair_one import GALLERY, SEQUENTIAL, Studio, SUMMARY, VERTICAL, package_at, synthesize, write_json
 from test_production_adapter import Bucket, FakeSession, Response
 
 
 NEW_GALLERY = "block-v1:FIRAx+TARGET+20261113+type@imagesgallery+block@new"
+BEFORE = "block-v1:FIRAx+TARGET+20261113+type@html+block@before"
+AFTER = "block-v1:FIRAx+TARGET+20261113+type@problem+block@after"
 TARGET = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
 
 
 class ReplacementStudio(Studio):
     def __init__(self):
         super().__init__()
-        self.children = [("html", "before"), ("imagesgallery", GALLERY), ("html", "summary"), ("problem", "after")]
+        self.children = [("html", BEFORE), ("imagesgallery", GALLERY), ("html", SUMMARY), ("problem", AFTER)]
         self.files = {GALLERY: [{"id": f"old-{n}", "filename": f"{n}.jpg"} for n in (2, 1, 3)]}
         self.configs = {GALLERY: copy.deepcopy(self.config)}
         self.audio_bindings = {GALLERY: copy.deepcopy(self.audios)}
@@ -95,7 +97,7 @@ def test_different_image_order_replaces_only_gallery_after_complete_readback(tmp
     result = run(package, studio)
 
     assert result["status"] == "success"
-    assert studio.children == [("html", "before"), ("imagesgallery", NEW_GALLERY), ("html", "summary"), ("problem", "after")]
+    assert studio.children == [("html", BEFORE), ("imagesgallery", NEW_GALLERY), ("html", SUMMARY), ("problem", AFTER)]
     assert studio.deleted == [GALLERY] and studio.published
     assert len(studio.audio_bindings[NEW_GALLERY]) == 1
     assert studio.configs[NEW_GALLERY]["unrelated_setting"] == "keep"
@@ -152,6 +154,58 @@ def test_concurrent_new_gallery_config_is_not_overwritten(tmp_path):
     studio = ConcurrentConfig()
     assert run(package, studio)["status"] == "unconfirmed"
     assert studio.configs[NEW_GALLERY] == {"concurrent_setting": "keep"}
+    assert studio.deleted == [] and not studio.published
+
+
+def test_nonempty_new_gallery_initial_config_is_not_overwritten(tmp_path):
+    class ChangedAtCreation(ReplacementStudio):
+        def create_gallery(self, vertical):
+            identity = super().create_gallery(vertical)
+            self.configs[identity] = {"concurrent_setting": "keep"}
+            return identity
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedAtCreation()
+    assert run(package, studio)["status"] == "unconfirmed"
+    assert studio.configs[NEW_GALLERY] == {"concurrent_setting": "keep"}
+    assert studio.uploaded_paths == [] and studio.deleted == [] and not studio.published
+
+
+def test_new_gallery_with_unexpected_metadata_is_not_claimed(tmp_path):
+    class ChangedMetadata(ReplacementStudio):
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY:
+                details["metadata"] = {"display_name": "并发修改"}
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedMetadata()
+    assert run(package, studio)["status"] == "unconfirmed"
+    assert studio.uploaded_paths == [] and studio.deleted == [] and not studio.published
+
+
+def test_concurrent_new_gallery_metadata_change_stops_replacement(tmp_path):
+    class ChangedMetadata(ReplacementStudio):
+        edited = False
+
+        def upload_image(self, locator, path):
+            result = super().upload_image(locator, path)
+            self.edited = True
+            return result
+
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY and self.edited:
+                details["metadata"] = {"display_name": "并发修改"}
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedMetadata()
+    assert run(package, studio)["status"] == "unconfirmed"
     assert studio.deleted == [] and not studio.published
 
 

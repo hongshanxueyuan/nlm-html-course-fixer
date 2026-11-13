@@ -6,8 +6,8 @@ from pathlib import Path
 import shutil
 import uuid
 
-from .repair_one import RepairError, _assert_no_credentials, _audio, _config, _files, _replace, _retry_read, _target, _write
-from .image_upload import upload_image
+from .repair_one import RepairError, _audio, _config, _files, _replace, _retry_read, _target, _write
+from .image_upload import check_candidate_metadata, confirm_empty_gallery, upload_image
 
 
 def replace_gallery(studio, course_id, chapter, section, target, old_files, old_audio, old_config, new_config, images, audio_path, output):
@@ -55,11 +55,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     created_target = _target(studio, course_id, chapter, section, new_gallery)
     if created_target[:2] != target[:2] or created_target[3] != current_children or created_target[4] != sibling_snapshot:
         raise RepairError("new Gallery identity could not be confirmed")
-    initial_payload = _retry_read(lambda: studio.get_play_config(new_gallery))
-    initial_config = initial_payload.get("play_config") if isinstance(initial_payload, dict) else None
-    if not isinstance(initial_config, dict):
-        raise RepairError("new Gallery initial play config is unreadable")
-    _assert_no_credentials(initial_config)
+    initial_config = confirm_empty_gallery(studio, new_gallery)
     state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current_children,
                   "initial_config": initial_config})
     _write(state_path, state)
@@ -70,6 +66,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
                 or _files(studio, old_gallery) != old_files or _audio(studio, old_gallery) != old_audio
                 or _config(studio, old_gallery) != old_config):
             raise RepairError("original Gallery or unit changed during replacement")
+        check_candidate_metadata(studio, new_gallery)
 
     check_original(current_children)
     uploaded = _files(studio, new_gallery)

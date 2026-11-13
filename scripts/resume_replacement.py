@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from .repair_one import RepairError, _audio, _config, _files, _json, _replace, _retry_read, _sha256, _target, _target_from_saved, _write
-from .image_upload import upload_image
+from .image_upload import check_candidate_metadata, confirm_empty_gallery, upload_image
 
 
 def resume_replacement(studio, course_id, chapter, section, output, images, prepared):
@@ -29,15 +29,16 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
     if state["stage"] == "create_pending":
         current = _target(studio, course_id, chapter, section, old_gallery)
         additions = [child for child in current[3] if child not in baseline]
-        if (not isinstance(new_gallery, str) or not new_gallery or not isinstance(state.get("initial_config"), dict)
+        if (not isinstance(new_gallery, str) or not new_gallery
                 or current[:3] != (sequential, vertical, old_gallery) or current[4] != old_target[4] or len(additions) != 1
                 or additions[0][0] != "imagesgallery" or tuple(child for child in current[3] if child != additions[0]) != baseline):
             raise RepairError("new Gallery creation remains unconfirmed")
         if additions[0][1] != new_gallery:
             raise RepairError("new Gallery creation remains unconfirmed")
-        state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current[3]})
+        state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current[3],
+                      "initial_config": confirm_empty_gallery(studio, new_gallery)})
         _write(state_path, state)
-    if not new_gallery or not isinstance(state.get("initial_config"), dict):
+    if not new_gallery or state.get("initial_config") != {}:
         raise RepairError("replacement Gallery identity is unavailable")
     created = tuple(tuple(row) for row in state.get("created_children", []))
     moved = list(baseline)
@@ -52,11 +53,13 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
         return current[3]
 
     def verify_new():
+        check_candidate_metadata(studio, new_gallery)
         if (_files(studio, new_gallery) != expected_files or _audio(studio, new_gallery) != new_audio
                 or _config(studio, new_gallery) != prepared["config"]):
             raise RepairError("replacement Gallery changed")
 
     def verify_old():
+        check_candidate_metadata(studio, new_gallery)
         if (_files(studio, old_gallery) != prepared["files"] or _audio(studio, old_gallery) != prepared["old_audio"]
                 or _config(studio, old_gallery) != prepared["old_config"]):
             raise RepairError("original Gallery changed")

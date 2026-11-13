@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -44,6 +45,16 @@ class Studio:
 
     def get_course_publication_structure(self, course_id):
         return self.audit.sequential_publication_sections(self.client.get_course_publication_structure(course_id))
+
+    def get_block_details(self, locator):
+        prefix = "block-v1:" + self.course_id.removeprefix("course-v1:") + "+type@"
+        if not isinstance(locator, str) or not re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]+\+block@[A-Za-z0-9_.~-]+", locator):
+            raise ValueError("block locator does not belong to target course")
+        response = self.client.session.get(
+            f"{self.base}/xblock/{locator}", headers={"Accept": "application/json"},
+            timeout=60, allow_redirects=False,
+        )
+        return self.client._json_response(response, "xblock_content")
 
     def _context(self, gallery_id):
         return {"studio_base": self.base, "block_locator": gallery_id,

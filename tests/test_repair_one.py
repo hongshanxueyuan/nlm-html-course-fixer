@@ -8,6 +8,7 @@ from scripts.repair_one import repair_one
 SEQUENTIAL = "block-v1:FIRAx+TARGET+20261113+type@sequential+block@section"
 VERTICAL = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unit"
 GALLERY = "block-v1:FIRAx+TARGET+20261113+type@imagesgallery+block@gallery"
+SUMMARY = "block-v1:FIRAx+TARGET+20261113+type@html+block@summary"
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,11 +55,15 @@ class Studio:
                 {"category": "sequential", "display_name": "1.2 测试", "id": SEQUENTIAL, "child_info": {"children": [
                     {"category": "vertical", "display_name": "赋能内容", "id": VERTICAL, "child_info": {"children": [
                         {"category": "imagesgallery", "id": GALLERY},
-                        {"category": "html", "display_name": "本节要点", "id": "summary"},
+                        {"category": "html", "display_name": "本节要点", "id": SUMMARY},
                     ]}},
                 ]}},
             ]}},
         ]}}
+
+    def get_block_details(self, locator):
+        category = locator.split("+type@", 1)[1].split("+", 1)[0] if "+type@" in locator else ("vertical" if locator == "other-unit" else "html")
+        return {"id": locator, "category": category, "data": "", "metadata": {}}
 
     def get_files(self, locator):
         return {"files": [{"id": f"asset-{n}", "filename": f"{n}.jpg"} for n in range(1, 4)], "total_count": 3}

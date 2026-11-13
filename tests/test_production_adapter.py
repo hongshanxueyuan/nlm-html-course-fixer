@@ -33,6 +33,9 @@ class FakeSession:
         self.cookies = requests.cookies.RequestsCookieJar()
 
     def get(self, url, **kwargs):
+        path = urlparse(url).path
+        if path.startswith("/xblock/"):
+            return Response(self.state.get_block_details(path.removeprefix("/xblock/")))
         if kwargs.get("params") == {"format": "concise"}:
             return Response(self.state.get_course_structure("unused"))
         tree = self.state.get_course_structure("unused")
@@ -100,6 +103,95 @@ def test_repair_uses_existing_studio_adapter_against_simulated_http_and_oss(tmp_
     assert state.published and len(state.audios) == 1
     assert state.audios[0]["document_id"] == "12345678-1234-1234-1234-123456789abc.mp3"
     assert [row["subtitle"] for row in state.config["time_config"]] == ["# 测试", "第一段。", "第二段。"]
+
+
+def test_real_adapter_detects_sibling_html_body_change_with_unchanged_concise_tree(tmp_path, monkeypatch):
+    summary = "block-v1:FIRAx+TARGET+20261113+type@html+block@other_summary"
+    sibling = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@other_unit"
+
+    class ContentStudio(FakeStudio):
+        body = "<p>original sibling content</p>"
+
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            section["child_info"]["children"].append({"category": "vertical", "id": sibling,
+                "display_name": "在线训战", "child_info": {"children": [{"category": "html", "id": summary}]}})
+            return tree
+
+    class ContentSession(FakeSession):
+        def get(self, url, **kwargs):
+            path = urlparse(url).path
+            if path.startswith("/xblock/"):
+                locator = path.removeprefix("/xblock/")
+                category = locator.split("+type@", 1)[1].split("+", 1)[0]
+                return Response({"id": locator, "category": category,
+                                 "data": self.state.body if locator == summary else "",
+                                 "metadata": {}, "edited_on": "2026-11-13 10:00"})
+            return super().get(url, **kwargs)
+
+    package = tmp_path / "package"
+    package_at(package)
+    state = ContentStudio()
+    monkeypatch.setenv("FIRA_SAAS_OP_COOKIE", "csrftoken=test")
+    monkeypatch.setattr(requests, "Session", lambda: ContentSession(state))
+    monkeypatch.setitem(sys.modules, "oss2", types.SimpleNamespace(
+        StsAuth=lambda *args: object(), Bucket=Bucket, determine_part_size=lambda *args, **kwargs: 1024 * 1024,
+        SizedFileAdapter=lambda file, size: file, models=types.SimpleNamespace(PartInfo=lambda number, etag: (number, etag))))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
+    target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
+
+    def concurrent_synthesis(manifest, voice, output):
+        audio = synthesize(manifest, voice, output)
+        state.body = "<p>concurrent sibling edit</p>"
+        return audio
+
+    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=Studio(target, tenants))
+    assert result["status"] != "success" and "changed" in result["reason"] and not state.published
+
+
+def test_real_adapter_stops_for_component_with_unobservable_content_fields(tmp_path, monkeypatch):
+    class VideoStudio(FakeStudio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            unit = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
+            unit["child_info"]["children"].append({"category": "video",
+                "id": "block-v1:FIRAx+TARGET+20261113+type@video+block@video"})
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    state = VideoStudio()
+    monkeypatch.setenv("FIRA_SAAS_OP_COOKIE", "csrftoken=test")
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession(state))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
+    target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
+    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
+    assert result["status"] == "unconfirmed"
+    assert not state.published and state.audios == [{"document_id": "old.mp3", "file_name": "old.mp3"}]
+
+
+def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, monkeypatch):
+    class IncompleteStudio(FakeStudio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            section["child_info"]["children"].append({"category": "vertical", "has_children": True,
+                "id": "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unreadable"})
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    state = IncompleteStudio()
+    monkeypatch.setenv("FIRA_SAAS_OP_COOKIE", "csrftoken=test")
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession(state))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
+    target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
+    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
+    assert result["status"] == "unconfirmed" and not state.published
 
 
 def test_repair_uses_existing_tts_script_with_a_simulated_bl_boundary(tmp_path, monkeypatch):
