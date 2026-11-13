@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .repair_one import _json, _write, repair_one
+from .repair_one import _json, _retry_read, _write, repair_one
 
 
 def _first_chapter(package, repair_dir):
@@ -11,7 +11,7 @@ def _first_chapter(package, repair_dir):
     for path in [*package.rglob("course-content.json"), *package.rglob("fira_course-*.json")]:
         if path.resolve().is_relative_to(repair_dir):
             continue
-        source = _json(path)
+        source = _retry_read(lambda: _json(path))
         chapters = source.get("chapters", [])
         # FIRA course exports include a pre-course "训战启程" chapter.
         lessons = [chapter for chapter in chapters if chapter.get("name") != "训战启程"]
@@ -27,7 +27,7 @@ def _section_chapter(package, repair_dir, title):
     for path in [*package.rglob("course-content.json"), *package.rglob("fira_course-*.json")]:
         if path.resolve().is_relative_to(repair_dir):
             continue
-        source = _json(path)
+        source = _retry_read(lambda: _json(path))
         for chapter in source.get("chapters", []):
             for section in chapter.get("sections", []):
                 if section.get("name") == title:
@@ -50,14 +50,14 @@ def run_batch(package, target_url, repair_dir, *, studio, synthesize, split=None
     repair_dir.mkdir(parents=True, exist_ok=True)
     marker.touch(exist_ok=True)
     if first_chapter:
-        chapter = _first_chapter(package, repair_dir)
+        chapter = _retry_read(lambda: _first_chapter(package, repair_dir))
     if agent_factory is None and (split is None or review is None):
         raise ValueError("split and review boundaries are required")
     ids, titles = [], {}
     for path in package.rglob("section-list.json"):
         if path.resolve().is_relative_to(repair_dir):
             continue
-        for item in _json(path).get("sections", []):
+        for item in _retry_read(lambda: _json(path)).get("sections", []):
             if item.get("block_type") == "html" and item.get("section_id") not in ids:
                 ids.append(item.get("section_id"))
                 titles[item.get("section_id")] = item.get("section_title")
@@ -69,7 +69,7 @@ def run_batch(package, target_url, repair_dir, *, studio, synthesize, split=None
         try:
             if section_id not in ids:
                 raise ValueError("section is not an HTML entry in the source manifest")
-            if chapter is not None and _section_chapter(package, repair_dir, titles[section_id]) != chapter:
+            if chapter is not None and _retry_read(lambda: _section_chapter(package, repair_dir, titles[section_id])) != chapter:
                 continue
             agent = agent_factory(section_id) if agent_factory else None
             result = repair_one(package, target_url, section_id, repair_dir, split=agent.split if agent else split,

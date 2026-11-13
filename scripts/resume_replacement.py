@@ -1,7 +1,8 @@
 """Reconcile a persisted replacement with the current Gallery before continuing."""
 from pathlib import Path
 
-from .repair_one import RepairError, _audio, _config, _files, _json, _replace, _sha256, _target, _write
+from .repair_one import RepairError, _audio, _config, _files, _json, _replace, _retry_read, _sha256, _target, _target_from_saved, _write
+from .image_upload import upload_image
 
 
 def resume_replacement(studio, course_id, chapter, section, output, images, prepared):
@@ -11,7 +12,7 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
               "audio_uploaded", "verified", "reorder_pending", "delete_pending", "replaced"}
     if state.get("course_id") != course_id or state.get("stage") not in stages:
         raise RepairError("replacement stage cannot be safely reconciled")
-    old_target = prepared["target"]
+    old_target = _target_from_saved(prepared["target"])
     sequential, vertical, old_gallery = old_target[:3]
     baseline = tuple(tuple(row) for row in old_target[3])
     new_gallery = state.get("new_gallery")
@@ -28,13 +29,15 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
     if state["stage"] == "create_pending":
         current = _target(studio, course_id, chapter, section, old_gallery)
         additions = [child for child in current[3] if child not in baseline]
-        if (current[:3] != (sequential, vertical, old_gallery) or len(additions) != 1
+        if (not isinstance(new_gallery, str) or not new_gallery or not isinstance(state.get("initial_config"), dict)
+                or current[:3] != (sequential, vertical, old_gallery) or current[4] != old_target[4] or len(additions) != 1
                 or additions[0][0] != "imagesgallery" or tuple(child for child in current[3] if child != additions[0]) != baseline):
             raise RepairError("new Gallery creation remains unconfirmed")
-        new_gallery = additions[0][1]
+        if additions[0][1] != new_gallery:
+            raise RepairError("new Gallery creation remains unconfirmed")
         state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current[3]})
         _write(state_path, state)
-    if not new_gallery:
+    if not new_gallery or not isinstance(state.get("initial_config"), dict):
         raise RepairError("replacement Gallery identity is unavailable")
     created = tuple(tuple(row) for row in state.get("created_children", []))
     moved = list(baseline)
@@ -44,7 +47,7 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
 
     def read_children():
         current = _target(studio, course_id, chapter, section, new_gallery)
-        if current[:2] != (sequential, vertical):
+        if current[:2] != (sequential, vertical) or current[4] != old_target[4]:
             raise RepairError("replacement unit changed")
         return current[3]
 
@@ -59,7 +62,8 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
             raise RepairError("original Gallery changed")
 
     if state["stage"] in {"created", "upload_pending", "uploading"}:
-        if _target(studio, course_id, chapter, section, old_gallery)[3] != created:
+        current_old = _target(studio, course_id, chapter, section, old_gallery)
+        if current_old[3] != created or current_old[4] != old_target[4]:
             raise RepairError("replacement unit changed before image upload")
         verify_old()
         uploaded = _files(studio, new_gallery)
@@ -89,25 +93,14 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
         for row in mapping:
             if row.get("asset_id"):
                 continue
-            if _target(studio, course_id, chapter, section, old_gallery)[3] != created:
+            current_old = _target(studio, course_id, chapter, section, old_gallery)
+            if current_old[3] != created or current_old[4] != old_target[4]:
                 raise RepairError("replacement unit changed during image upload")
             verify_old()
             path = Path(row["isolated_file"])
             state.update({"stage": "upload_pending", "pending_file": path.name})
             _write(state_path, state)
-            returned = None
-            try:
-                returned = studio.upload_image(new_gallery, path)
-            except Exception:
-                pass
-            observed = _files(studio, new_gallery)
-            additions = [item for item in observed if item not in uploaded]
-            if (len(additions) != 1 or additions[0]["filename"] != path.name
-                    or [item for item in observed if item != additions[0]] != uploaded
-                    or (returned and str(returned) != additions[0]["id"])):
-                raise RepairError("image upload outcome is unconfirmed")
-            row["asset_id"] = additions[0]["id"]
-            uploaded = observed
+            row["asset_id"], uploaded = upload_image(studio, new_gallery, path, uploaded)
             _write(output / "image-map.json", mapping)
             state.update({"stage": "uploading", "pending_file": None})
             _write(state_path, state)
@@ -142,20 +135,17 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
         if _files(studio, new_gallery) != expected_files:
             raise RepairError("replacement images changed")
         def bindings():
-            payload = studio.get_audios(new_gallery)
+            payload = _retry_read(lambda: studio.get_audios(new_gallery))
             rows = payload.get("audios") if isinstance(payload, dict) else None
             if not isinstance(rows, list):
                 raise RepairError("new Gallery audio is unreadable")
             return rows
         _replace(bindings, lambda value: studio.bind_audio(new_gallery, value[0]), [], [new_audio])
         def read_config():
-            value = studio.get_play_config(new_gallery).get("play_config")
+            value = _retry_read(lambda: studio.get_play_config(new_gallery)).get("play_config")
             if not isinstance(value, dict):
                 raise RepairError("new Gallery config is unreadable")
             return value
-        if "initial_config" not in state:
-            state["initial_config"] = read_config()
-            _write(state_path, state)
         _replace(read_config, lambda value: studio.update_play_config(new_gallery, value), state["initial_config"], prepared["config"])
         verify_old()
         verify_new()
@@ -182,7 +172,7 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
         raise RepairError("replacement structure changed")
     verify_new()
     target = _target(studio, course_id, chapter, section)
-    if target[:3] != (sequential, vertical, new_gallery) or target[3] != final:
+    if target[:3] != (sequential, vertical, new_gallery) or target[3] != final or target[4] != old_target[4]:
         raise RepairError("replacement structure could not be confirmed")
     state["stage"] = "replaced"
     _write(state_path, state)

@@ -42,6 +42,16 @@ def _json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _retry_read(read):
+    """Retry only read-only operations; never repeat an uncertain write."""
+    for attempt in range(3):
+        try:
+            return read()
+        except Exception:
+            if attempt == 2:
+                raise
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -168,6 +178,10 @@ def _load_inputs(package, section_id, repair_dir):
 
 
 def _target(studio, course_id, chapter_name, section_title, gallery_locator=None):
+    return _retry_read(lambda: _read_target(studio, course_id, chapter_name, section_title, gallery_locator))
+
+
+def _read_target(studio, course_id, chapter_name, section_title, gallery_locator=None):
     root = studio.get_course_structure(course_id)
     chapter = _one([x for x in _children(root) if x.get("category") == "chapter" and x.get("display_name", "").strip() == chapter_name], "target chapter")
     sequential = _one([x for x in _children(chapter) if x.get("category") == "sequential" and x.get("display_name", "").strip() == section_title], "target sequential")
@@ -181,10 +195,27 @@ def _target(studio, course_id, chapter_name, section_title, gallery_locator=None
     children = tuple((x.get("category"), locator(x)) for x in _children(vertical))
     if any(not category or not child_id for category, child_id in children):
         raise RepairError("target unit structure is incomplete")
-    return *ids, children
+    # The sequential is published as a whole. Preserve the order and the
+    # complete readable state of its other units while the target unit changes.
+    other_components = [x for x in _children(vertical) if x.get("category") != "imagesgallery"]
+    siblings = [({"target_vertical": ids[1], "other_components": other_components} if x is vertical else x)
+                for x in _children(sequential)]
+    sibling_snapshot = hashlib.sha256(json.dumps(siblings, ensure_ascii=False, sort_keys=True,
+                                                  separators=(",", ":")).encode("utf-8")).hexdigest()
+    return *ids, children, sibling_snapshot
+
+
+def _target_from_saved(value):
+    if not isinstance(value, (tuple, list)) or len(value) != 5 or not isinstance(value[4], str):
+        raise RepairError("saved sequential snapshot is unavailable")
+    return tuple(value[:3]) + (tuple(tuple(row) for row in value[3]), value[4])
 
 
 def _files(studio, gallery_id):
+    return _retry_read(lambda: _read_files(studio, gallery_id))
+
+
+def _read_files(studio, gallery_id):
     payload = studio.get_files(gallery_id)
     files = payload.get("files")
     if not isinstance(files, list) or isinstance(payload.get("total_count"), bool) or payload.get("total_count") != len(files):
@@ -204,6 +235,10 @@ def _files(studio, gallery_id):
 
 
 def _audio(studio, gallery_id):
+    return _retry_read(lambda: _read_audio(studio, gallery_id))
+
+
+def _read_audio(studio, gallery_id):
     value = studio.get_audios(gallery_id).get("audios")
     if not isinstance(value, list) or len(value) != 1 or not value[0].get("document_id") or not value[0].get("file_name"):
         raise RepairError("Gallery audio identity is not recoverable")
@@ -211,10 +246,25 @@ def _audio(studio, gallery_id):
 
 
 def _config(studio, gallery_id):
+    return _retry_read(lambda: _read_config(studio, gallery_id))
+
+
+def _read_config(studio, gallery_id):
     value = studio.get_play_config(gallery_id).get("play_config")
     if not isinstance(value, dict) or not isinstance(value.get("time_config"), list):
         raise RepairError("Gallery play config is unreadable")
     return value
+
+
+def _publication(studio, course_id, sequential_id):
+    return _retry_read(lambda: studio.get_course_publication_structure(course_id).get(sequential_id, {}))
+
+
+def _verify_gallery(studio, course_id, chapter, section, target, files, audio, config):
+    gallery = target[2]
+    if (_target(studio, course_id, chapter, section) != target or _files(studio, gallery) != files
+            or _audio(studio, gallery) != audio or _config(studio, gallery) != config):
+        raise RepairError("Gallery or sequential changed before publication")
 
 
 def _replace(read, write, original, desired):
@@ -279,7 +329,8 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
     replacing = False
     prior_complete = None
     try:
-        section, source_id, chapter_name, block, gallery, images, voice = _load_inputs(package, section_id, repair_dir)
+        section, source_id, chapter_name, block, gallery, images, voice = _retry_read(
+            lambda: _load_inputs(package, section_id, repair_dir))
         report["source_course_id"] = source_id
         input_digest = _input_digest(target_url, source_id, chapter_name, section, block, gallery, images, force_replace)
         common = _nlm()
@@ -293,6 +344,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
             saved = _json(state_path)
             if not isinstance(saved, dict) or saved.get("stage") not in {"prepared", "audio_upload_pending", "audio_uploaded", "publish_pending", "complete"}:
                 raise RepairError("saved run stage is unreadable")
+            _target_from_saved(saved.get("target"))
             if (saved.get("stage") == "prepared" and saved.get("input_digest") != input_digest
                     and not (output / "replacement-state.json").exists()):
                 report["status"] = "unconfirmed"
@@ -329,7 +381,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                             studio, course_id, chapter_name, section["section_title"], output, images, saved)
                     else:
                         from .replacement import replace_gallery
-                        old_target = tuple(saved["target"][:3]) + (tuple(tuple(row) for row in saved["target"][3]),)
+                        old_target = _target_from_saved(saved["target"])
                         resumed_target, resumed_files, resumed_audio = replace_gallery(
                             studio, course_id, chapter_name, section["section_title"], old_target,
                             saved["files"], saved["old_audio"], saved["old_config"], saved["config"],
@@ -338,12 +390,14 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     from .resume_inplace import resume_inplace
                     resumed_target, resumed_files, resumed_audio = resume_inplace(
                         studio, course_id, chapter_name, section["section_title"], output, saved)
-                sequential_id, vertical_id, gallery_id, children = resumed_target
+                sequential_id, vertical_id, gallery_id, children, _ = resumed_target
                 report.update({"sequential": sequential_id, "vertical": vertical_id, "gallery": gallery_id})
                 saved.update({"stage": "publish_pending", "audio": resumed_audio})
                 _write(state_path, saved)
                 for _ in range(3):
-                    publication = studio.get_course_publication_structure(course_id).get(sequential_id, {})
+                    _verify_gallery(studio, course_id, chapter_name, section["section_title"], resumed_target,
+                                    resumed_files, resumed_audio, saved["config"])
+                    publication = _publication(studio, course_id, sequential_id)
                     if publication.get("published") is True and publication.get("has_changes") is False:
                         break
                     if publication.get("published") not in (True, False) or publication.get("has_changes") not in (True, False):
@@ -353,7 +407,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     except Exception:
                         pass
                 else:
-                    publication = studio.get_course_publication_structure(course_id).get(sequential_id, {})
+                    publication = _publication(studio, course_id, sequential_id)
                     if publication.get("published") is not True or publication.get("has_changes") is not False:
                         raise RepairError("sequential publication not confirmed")
                 if (_target(studio, course_id, chapter_name, section["section_title"]) != resumed_target
@@ -374,7 +428,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
             if saved.get("stage") == "complete" and saved.get("input_digest") != input_digest:
                 report["status"] = "unconfirmed"
                 current = _target(studio, course_id, chapter_name, section["section_title"])
-                publication = studio.get_course_publication_structure(course_id).get(current[0], {})
+                publication = _publication(studio, course_id, current[0])
                 if (json.loads(json.dumps(current)) != saved["target"] or _files(studio, current[2]) != saved["files"]
                         or _audio(studio, current[2]) != saved["audio"] or _config(studio, current[2]) != saved["config"]
                         or publication.get("published") is not True or publication.get("has_changes") is not False):
@@ -393,7 +447,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     if _validate_audio(manifest_path, pages, saved_audio) != saved["config"]["time_config"]:
                         raise RepairError("saved timeline differs from checked audio")
                     current = _target(studio, course_id, chapter_name, section["section_title"])
-                    publication = studio.get_course_publication_structure(course_id).get(current[0], {})
+                    publication = _publication(studio, course_id, current[0])
                     if (json.loads(json.dumps(current)) == saved["target"]
                             and _files(studio, current[2]) == saved["files"]
                             and _audio(studio, current[2]) == saved["audio"]
@@ -456,7 +510,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     else:
                         old_path.replace(history / f"{nonce}-{name}")
         target = _target(studio, course_id, chapter_name, section["section_title"])
-        sequential_id, vertical_id, gallery_id, children = target
+        sequential_id, vertical_id, gallery_id, children, _ = target
         report.update({"sequential": sequential_id, "vertical": vertical_id, "gallery": gallery_id})
         files = _files(studio, gallery_id)
         same_previous_images = bool(prior_complete and prior_complete.get("images") == _image_digests(images))
@@ -499,7 +553,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 studio, course_id, chapter_name, section["section_title"], target, files,
                 old_audio, old_config, new_config, images, audio_path, output,
             )
-            sequential_id, vertical_id, gallery_id, children = target
+            sequential_id, vertical_id, gallery_id, children, _ = target
             report.update({"gallery": gallery_id, "replacement": True})
         else:
             state = _json(state_path)
@@ -541,11 +595,13 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         state.update({"stage": "publish_pending", "audio": new_audio})
         _write(state_path, state)
         for _ in range(3):
+            _verify_gallery(studio, course_id, chapter_name, section["section_title"], target,
+                            files, new_audio, new_config)
             try:
                 studio.publish_sequential(sequential_id)
             except Exception:
                 pass
-            published = studio.get_course_publication_structure(course_id).get(sequential_id, {})
+            published = _publication(studio, course_id, sequential_id)
             if published.get("published") is True and published.get("has_changes") is False:
                 if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files or _audio(studio, gallery_id) != new_audio or _config(studio, gallery_id) != new_config:
                     raise RepairError("Gallery changed after publication")

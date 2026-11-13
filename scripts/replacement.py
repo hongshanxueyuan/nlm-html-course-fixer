@@ -6,11 +6,12 @@ from pathlib import Path
 import shutil
 import uuid
 
-from .repair_one import RepairError, _audio, _config, _files, _replace, _target, _write
+from .repair_one import RepairError, _assert_no_credentials, _audio, _config, _files, _replace, _retry_read, _target, _write
+from .image_upload import upload_image
 
 
 def replace_gallery(studio, course_id, chapter, section, target, old_files, old_audio, old_config, new_config, images, audio_path, output):
-    sequential, vertical, old_gallery, baseline = target
+    sequential, vertical, old_gallery, baseline, sibling_snapshot = target
     state_path = output / "replacement-state.json"
     image_map_path = output / "image-map.json"
     copies = output / "isolated-images"
@@ -32,29 +33,40 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     def original_target():
         return _target(studio, course_id, chapter, section, old_gallery)
 
-    # Even when create times out, the actual structure is the authority.
     returned = None
     try:
         returned = studio.create_gallery(vertical)
     except Exception:
         pass
+    if isinstance(returned, str) and returned:
+        state["new_gallery"] = returned
+        _write(state_path, state)
     current = original_target()
+    if not isinstance(returned, str) or not returned:
+        # A newly appearing Gallery is not evidence of who created it.
+        raise RepairError("new Gallery creation identity is unconfirmed")
     current_children = current[3]
     additions = [child for child in current_children if child not in baseline]
-    if (current[:3] != target[:3] or len(additions) != 1 or additions[0][0] != "imagesgallery"
+    if (current[:3] != target[:3] or current[4] != sibling_snapshot or len(additions) != 1 or additions[0][0] != "imagesgallery"
             or tuple(child for child in current_children if child != additions[0]) != baseline
-            or (returned and returned != additions[0][1])):
+            or returned != additions[0][1]):
         raise RepairError("new Gallery creation could not be reconciled")
     new_gallery = additions[0][1]
     created_target = _target(studio, course_id, chapter, section, new_gallery)
-    if created_target[:2] != target[:2] or created_target[3] != current_children:
+    if created_target[:2] != target[:2] or created_target[3] != current_children or created_target[4] != sibling_snapshot:
         raise RepairError("new Gallery identity could not be confirmed")
-    state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current_children})
+    initial_payload = _retry_read(lambda: studio.get_play_config(new_gallery))
+    initial_config = initial_payload.get("play_config") if isinstance(initial_payload, dict) else None
+    if not isinstance(initial_config, dict):
+        raise RepairError("new Gallery initial play config is unreadable")
+    _assert_no_credentials(initial_config)
+    state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current_children,
+                  "initial_config": initial_config})
     _write(state_path, state)
 
     def check_original(expected_children):
         current = original_target()
-        if (current[:3] != target[:3] or current[3] != expected_children
+        if (current[:3] != target[:3] or current[3] != expected_children or current[4] != sibling_snapshot
                 or _files(studio, old_gallery) != old_files or _audio(studio, old_gallery) != old_audio
                 or _config(studio, old_gallery) != old_config):
             raise RepairError("original Gallery or unit changed during replacement")
@@ -65,21 +77,9 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         raise RepairError("new Gallery was not empty")
     for row in mapping:
         path = Path(row["isolated_file"])
-        asset = None
         state.update({"stage": "upload_pending", "pending_file": path.name})
         _write(state_path, state)
-        try:
-            asset = studio.upload_image(new_gallery, path)
-        except Exception:
-            pass
-        observed = _files(studio, new_gallery)
-        additions = [item for item in observed if item not in uploaded]
-        if (len(additions) != 1 or additions[0]["filename"] != path.name
-                or [item for item in observed if item != additions[0]] != uploaded
-                or (asset and str(asset) != additions[0]["id"])):
-            raise RepairError("image upload could not be reconciled")
-        row["asset_id"] = additions[0]["id"]
-        uploaded = observed
+        row["asset_id"], uploaded = upload_image(studio, new_gallery, path, uploaded)
         _write(image_map_path, mapping)
         state.update({"stage": "uploading", "pending_file": None})
         _write(state_path, state)
@@ -113,7 +113,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     _write(state_path, state)
 
     def bindings():
-        payload = studio.get_audios(new_gallery)
+        payload = _retry_read(lambda: studio.get_audios(new_gallery))
         rows = payload.get("audios") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             raise RepairError("new Gallery audio is unreadable")
@@ -123,15 +123,12 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         raise RepairError("new Gallery unexpectedly has audio")
     _replace(bindings, lambda value: studio.bind_audio(new_gallery, value[0]), [], [new_audio])
     def new_gallery_config():
-        payload = studio.get_play_config(new_gallery)
+        payload = _retry_read(lambda: studio.get_play_config(new_gallery))
         value = payload.get("play_config") if isinstance(payload, dict) else None
         if not isinstance(value, dict):
             raise RepairError("new Gallery play config is unreadable")
         return value
 
-    initial_config = new_gallery_config()
-    state["initial_config"] = initial_config
-    _write(state_path, state)
     _replace(new_gallery_config, lambda value: studio.update_play_config(new_gallery, value), initial_config, new_config)
     check_original(current_children)
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
@@ -145,7 +142,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     moved = tuple(moved)
     def children():
         observed = _target(studio, course_id, chapter, section, new_gallery)
-        if observed[:2] != target[:2]:
+        if observed[:2] != target[:2] or observed[4] != sibling_snapshot:
             raise RepairError("target unit identity changed")
         return observed[3]
 
@@ -160,7 +157,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     _write(state_path, state)
     _replace(children, lambda value: studio.delete_gallery(old_gallery), moved, final_children)
     final_target = _target(studio, course_id, chapter, section)
-    if final_target[:2] != (sequential, vertical) or final_target[2] != new_gallery or final_target[3] != final_children:
+    if final_target[:2] != (sequential, vertical) or final_target[2] != new_gallery or final_target[3] != final_children or final_target[4] != sibling_snapshot:
         raise RepairError("replacement structure could not be confirmed")
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
         raise RepairError("replacement Gallery changed after deletion")

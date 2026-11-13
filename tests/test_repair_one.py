@@ -199,6 +199,75 @@ def test_changed_unit_is_not_published_after_update(tmp_path):
     assert not studio.published
 
 
+def test_new_sibling_unit_during_audio_generation_is_not_published(tmp_path):
+    class ChangedSectionStudio(Studio):
+        changed = False
+
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            if self.changed:
+                section["child_info"]["children"].append({
+                    "category": "vertical", "display_name": "并发新增", "id": "other-unit",
+                    "child_info": {"children": []},
+                })
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedSectionStudio()
+
+    def concurrent_synthesis(manifest, voice, output):
+        audio = synthesize(manifest, voice, output)
+        studio.changed = True
+        return audio
+
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=studio)
+    assert result["status"] != "success"
+    assert not studio.published
+
+
+def test_transient_target_structure_read_is_retried_before_writing(tmp_path):
+    class TransientRead(Studio):
+        attempts = 0
+
+        def get_course_structure(self, course_id):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TimeoutError("temporary read failure")
+            return super().get_course_structure(course_id)
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = TransientRead()
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=studio)
+    assert result["status"] == "success" and studio.published
+
+
+def test_changed_sibling_component_metadata_is_not_published(tmp_path):
+    class ChangedComponentStudio(Studio):
+        changed = False
+
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            unit = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
+            if self.changed:
+                unit["child_info"]["children"][1]["display_name"] = "并发修改"
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedComponentStudio()
+
+    def concurrent_synthesis(manifest, voice, output):
+        audio = synthesize(manifest, voice, output)
+        studio.changed = True
+        return audio
+
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=studio)
+    assert result["status"] != "success" and not studio.published
+
+
 def test_source_course_json_can_use_original_export_filename(tmp_path):
     package = tmp_path / "package"
     package_at(package)

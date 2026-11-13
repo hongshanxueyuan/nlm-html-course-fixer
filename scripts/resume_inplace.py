@@ -1,9 +1,9 @@
 """Reconcile an in-place update after interruption."""
-from .repair_one import RepairError, RestoredRepairError, _audio, _config, _files, _replace, _target, _write
+from .repair_one import RepairError, RestoredRepairError, _audio, _config, _files, _replace, _target, _target_from_saved, _write
 
 
 def resume_inplace(studio, course_id, chapter, section, output, state):
-    target = tuple(state["target"][:3]) + (tuple(tuple(row) for row in state["target"][3]),)
+    target = _target_from_saved(state["target"])
     gallery = target[2]
 
     def verify_structure():

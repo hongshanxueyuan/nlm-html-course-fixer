@@ -144,6 +144,34 @@ def test_in_place_publication_response_interruption_is_confirmed_on_rerun(tmp_pa
     assert studio.publications == 1
 
 
+def test_resume_rechecks_gallery_before_retrying_publication(tmp_path):
+    class ConcurrentStudio(Studio):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        def publish_sequential(self, locator):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise SystemExit("interrupted before publication")
+            if self.attempts == 2:
+                self.config["unrelated_setting"] = "concurrent edit"
+                raise TimeoutError("response lost")
+            return super().publish_sequential(locator)
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ConcurrentStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    with pytest.raises(SystemExit):
+        run_batch(package, TARGET, package / "repair", **options)
+    result = run_batch(package, TARGET, package / "repair", **options)
+    assert result["sections"][0]["status"] == "unconfirmed"
+    assert not studio.published and studio.attempts == 2
+
+
 def test_failed_subtitle_update_during_resume_restores_old_binding(tmp_path):
     class InterruptedStudio(Studio):
         def __init__(self):
@@ -203,7 +231,33 @@ def test_replacement_resumes_after_image_upload_without_creating_again(tmp_path)
     assert studio.creates == 1 and len(studio.uploaded_paths) == 3 and studio.published
 
 
-def test_replacement_resumes_after_gallery_creation_without_creating_again(tmp_path):
+def test_resume_preserves_concurrent_new_gallery_config(tmp_path):
+    class InterruptedStudio(ReplacementStudio):
+        interrupt = True
+
+        def upload_image(self, locator, path):
+            result = super().upload_image(locator, path)
+            if self.interrupt:
+                self.interrupt = False
+                raise SystemExit("interrupted after image upload")
+            return result
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = InterruptedStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    with pytest.raises(SystemExit):
+        run_batch(package, TARGET, package / "repair", **options)
+    studio.configs[NEW_GALLERY] = {"concurrent_setting": "keep"}
+    report = run_batch(package, TARGET, package / "repair", **options)
+    assert report["sections"][0]["status"] == "unconfirmed"
+    assert studio.configs[NEW_GALLERY] == {"concurrent_setting": "keep"}
+    assert studio.deleted == [] and not studio.published
+
+
+def test_replacement_without_confirmed_creation_identity_stays_unconfirmed(tmp_path):
     class InterruptedStudio(ReplacementStudio):
         def __init__(self):
             super().__init__()
@@ -222,8 +276,8 @@ def test_replacement_resumes_after_gallery_creation_without_creating_again(tmp_p
     with pytest.raises(SystemExit):
         run_batch(package, TARGET, package / "repair", **options)
     result = run_batch(package, TARGET, package / "repair", **options)
-    assert result["sections"][0]["status"] == "success"
-    assert studio.creates == 1 and studio.deleted == [GALLERY] and studio.published
+    assert result["sections"][0]["status"] == "unconfirmed"
+    assert studio.creates == 1 and studio.deleted == [] and not studio.published
 
 
 def test_replacement_resumes_after_new_audio_binding_without_reupload(tmp_path):

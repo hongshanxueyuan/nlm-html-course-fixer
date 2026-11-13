@@ -125,7 +125,37 @@ def test_uncertain_creation_never_repeats_or_publishes(tmp_path):
     assert ("imagesgallery", GALLERY) in studio.children
 
 
-def test_timed_out_writes_are_reconciled_from_current_studio_state(tmp_path):
+def test_unattributed_new_gallery_is_never_claimed_after_timeout(tmp_path):
+    class ConcurrentCreation(ReplacementStudio):
+        def create_gallery(self, vertical):
+            # Another editor creates this block while our own request fails.
+            super().create_gallery(vertical)
+            raise TimeoutError("our create outcome is unknown")
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ConcurrentCreation()
+    assert run(package, studio)["status"] == "unconfirmed"
+    assert run(package, studio)["status"] == "unconfirmed"
+    assert studio.uploaded_paths == [] and studio.deleted == [] and not studio.published
+
+
+def test_concurrent_new_gallery_config_is_not_overwritten(tmp_path):
+    class ConcurrentConfig(ReplacementStudio):
+        def upload_image(self, locator, path):
+            identity = super().upload_image(locator, path)
+            self.configs[locator] = {"concurrent_setting": "keep"}
+            return identity
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ConcurrentConfig()
+    assert run(package, studio)["status"] == "unconfirmed"
+    assert studio.configs[NEW_GALLERY] == {"concurrent_setting": "keep"}
+    assert studio.deleted == [] and not studio.published
+
+
+def test_timed_out_image_and_delete_are_reconciled_from_current_studio_state(tmp_path):
     class TimedOutWrites(ReplacementStudio):
         def __init__(self):
             super().__init__()
@@ -133,8 +163,7 @@ def test_timed_out_writes_are_reconciled_from_current_studio_state(tmp_path):
 
         def create_gallery(self, vertical):
             self.creates += 1
-            super().create_gallery(vertical)
-            raise TimeoutError("created but response lost")
+            return super().create_gallery(vertical)
 
         def upload_image(self, locator, path):
             self.uploads += 1
