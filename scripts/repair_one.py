@@ -211,9 +211,16 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
         identity = locator(node)
         if kind not in {"sequential", "vertical", "html", "problem", "imagesgallery"} or not identity:
             raise UnconfirmedRepairError("a component type cannot be checked with the available Studio reads")
-        if kind in {"sequential", "vertical"} and (
-                not isinstance(node.get("child_info"), dict)
-                or not isinstance(node["child_info"].get("children"), list)):
+        info = node.get("child_info")
+        has_children = node.get("has_children")
+        if "has_children" in node and not isinstance(has_children, bool):
+            raise UnconfirmedRepairError("the sequential structure is incomplete")
+        if info is None:
+            if has_children is True or (kind in {"sequential", "vertical"} and has_children is not False):
+                raise UnconfirmedRepairError("the sequential structure is incomplete")
+        elif not isinstance(info, dict) or not isinstance(info.get("children"), list):
+            raise UnconfirmedRepairError("the sequential structure is incomplete")
+        elif has_children is False and info["children"]:
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         try:
             details = studio.get_block_details(identity)

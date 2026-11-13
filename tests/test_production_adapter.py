@@ -7,6 +7,7 @@ import time
 import types
 from urllib.parse import urlparse
 
+import pytest
 import requests
 
 from scripts.production import AgentBridge, Studio, synthesize as existing_synthesizer
@@ -192,6 +193,63 @@ def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, 
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
     result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
     assert result["status"] == "unconfirmed" and not state.published
+
+
+@pytest.mark.parametrize("shape", [
+    {"has_children": False},
+    {"has_children": False, "child_info": {"children": []}},
+    {"has_children": True, "child_info": {"children": []}},
+])
+def test_real_adapter_accepts_explicitly_empty_sibling_unit(tmp_path, monkeypatch, shape):
+    class EmptyStudio(FakeStudio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            section["child_info"]["children"].append({"category": "vertical", **shape,
+                "id": "block-v1:FIRAx+TARGET+20261113+type@vertical+block@empty"})
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    state = EmptyStudio()
+    monkeypatch.setenv("FIRA_SAAS_OP_COOKIE", "csrftoken=test")
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession(state))
+    monkeypatch.setitem(sys.modules, "oss2", types.SimpleNamespace(
+        StsAuth=lambda *args: object(), Bucket=Bucket, determine_part_size=lambda *args, **kwargs: 1024 * 1024,
+        SizedFileAdapter=lambda file, size: file, models=types.SimpleNamespace(PartInfo=lambda number, etag: (number, etag))))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
+    target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
+    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
+    assert result["status"] == "success" and state.published
+
+
+@pytest.mark.parametrize("shape", [
+    {"has_children": False, "child_info": {"children": [
+        {"category": "html", "id": "block-v1:FIRAx+TARGET+20261113+type@html+block@extra"}]}},
+    {"has_children": "false"},
+    {},
+])
+def test_real_adapter_rejects_ambiguous_or_contradictory_sibling_unit(tmp_path, monkeypatch, shape):
+    class AmbiguousStudio(FakeStudio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            section["child_info"]["children"].append({"category": "vertical", **shape,
+                "id": "block-v1:FIRAx+TARGET+20261113+type@vertical+block@ambiguous"})
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    state = AmbiguousStudio()
+    monkeypatch.setenv("FIRA_SAAS_OP_COOKIE", "csrftoken=test")
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession(state))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
+    target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
+    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
+    assert result["status"] == "unconfirmed" and result["phase"] == "target"
+    assert result["reason"] == "the sequential structure is incomplete" and not state.published
 
 
 def test_repair_uses_existing_tts_script_with_a_simulated_bl_boundary(tmp_path, monkeypatch):
