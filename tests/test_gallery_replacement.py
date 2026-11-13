@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pytest
 import requests
 
 from scripts.production import Studio as RealStudio
@@ -32,12 +33,26 @@ class ReplacementStudio(Studio):
     def get_course_structure(self, course_id):
         tree = super().get_course_structure(course_id)
         vertical = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
-        vertical["child_info"]["children"] = [{"category": kind, "id": identity} for kind, identity in self.children]
+        vertical["child_info"]["children"] = [{"category": kind, "id": identity, **({"has_children": False} if kind == "imagesgallery" else {})} for kind, identity in self.children]
         return tree
 
     def get_files(self, locator):
         rows = self.files[locator]
         return {"files": copy.deepcopy(rows), "total_count": len(rows)}
+
+    def get_block_details(self, locator):
+        details = super().get_block_details(locator)
+        if locator == NEW_GALLERY and locator in self.files:
+            metadata = {}
+            if self.files[locator]:
+                metadata["contents"] = copy.deepcopy(self.files[locator])
+                metadata["content_names"] = [row.get("display_name") or row.get("filename") for row in self.files[locator]]
+            if self.audio_bindings[locator]:
+                metadata["audio_contents"] = copy.deepcopy(self.audio_bindings[locator])
+            if self.configs[locator]:
+                metadata["play_config"] = copy.deepcopy(self.configs[locator])
+            details["metadata"] = metadata
+        return details
 
     def get_play_config(self, locator):
         return {"play_config": copy.deepcopy(self.configs[locator])}
@@ -106,6 +121,24 @@ def test_different_image_order_replaces_only_gallery_after_complete_readback(tmp
     mapping = json.loads((package / "repair" / "1.2" / "image-map.json").read_text(encoding="utf-8"))
     assert len(mapping) == 3 and [item["asset_id"] for item in mapping] == ["new-1", "new-2", "new-3"]
     assert all((package / path).read_bytes() == data for path, data in before.items())
+
+
+def test_new_gallery_with_unreadable_children_never_replaces_old_gallery(tmp_path):
+    class IncompleteCandidate(ReplacementStudio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            unit = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
+            for child in unit["child_info"]["children"]:
+                if child.get("id") == NEW_GALLERY:
+                    child["has_children"] = True
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = IncompleteCandidate()
+    result = run(package, studio)
+    assert result["status"] == "unconfirmed"
+    assert studio.uploaded_paths == [] and studio.deleted == [] and not studio.published
 
 
 def test_uncertain_creation_never_repeats_or_publishes(tmp_path):
@@ -207,6 +240,85 @@ def test_concurrent_new_gallery_metadata_change_stops_replacement(tmp_path):
     studio = ChangedMetadata()
     assert run(package, studio)["status"] == "unconfirmed"
     assert studio.deleted == [] and not studio.published
+
+
+@pytest.mark.parametrize("field,value", [
+    ("contents", [{"id": "other", "display_name": "other.jpg"}]),
+    ("content_names", ["concurrent-change.jpg"]),
+    ("audio_contents", [{"document_id": "other.mp3", "file_name": "other.mp3"}]),
+    ("play_config", {"concurrent_setting": True}),
+])
+def test_concurrent_new_gallery_metadata_mismatch_stops_replacement(tmp_path, field, value):
+    class ChangedMetadata(ReplacementStudio):
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY and self.files[locator]:
+                details["metadata"][field] = value
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedMetadata()
+    result = run(package, studio)
+    assert result["status"] == "unconfirmed" and studio.deleted == [] and not studio.published
+
+
+def test_consistent_but_unexpected_candidate_image_stops_before_audio_upload(tmp_path):
+    class ConcurrentFile(ReplacementStudio):
+        changed = False
+        audio_uploads = 0
+
+        def get_block_details(self, locator):
+            if locator == NEW_GALLERY and len(self.files[locator]) == 3 and not self.changed:
+                self.changed = True
+                self.files[locator].append({"id": "other", "display_name": "other.jpg"})
+            return super().get_block_details(locator)
+
+        def upload_audio(self, locator, path):
+            self.audio_uploads += 1
+            return super().upload_audio(locator, path)
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ConcurrentFile()
+    result = run(package, studio)
+    assert result["status"] == "unconfirmed" and studio.audio_uploads == 0
+    assert studio.deleted == [] and not studio.published
+
+
+def test_candidate_metadata_change_after_delete_is_not_published(tmp_path):
+    class ChangedBeforePublish(ReplacementStudio):
+        after_delete_reads = 0
+
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY and self.deleted:
+                self.after_delete_reads += 1
+                if self.after_delete_reads >= 2:
+                    details["metadata"]["content_names"] = ["concurrent-change.jpg"]
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedBeforePublish()
+    result = run(package, studio)
+    assert result["status"] == "unconfirmed"
+    assert studio.deleted == [GALLERY] and not studio.published
+
+
+def test_candidate_metadata_change_during_publication_is_not_reported_as_success(tmp_path):
+    class ChangedDuringPublish(ReplacementStudio):
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY and self.published:
+                details["metadata"]["content_names"] = ["concurrent-change.jpg"]
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedDuringPublish()
+    result = run(package, studio)
+    assert result["status"] == "unconfirmed" and studio.published
 
 
 def test_timed_out_image_and_delete_are_reconciled_from_current_studio_state(tmp_path):

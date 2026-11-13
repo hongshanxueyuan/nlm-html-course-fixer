@@ -53,13 +53,15 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
         return current[3]
 
     def verify_new():
-        check_candidate_metadata(studio, new_gallery)
+        check_candidate_metadata(studio, new_gallery, expected_files=expected_files,
+                                 expected_audios=[new_audio], expected_config=prepared["config"])
         if (_files(studio, new_gallery) != expected_files or _audio(studio, new_gallery) != new_audio
                 or _config(studio, new_gallery) != prepared["config"]):
             raise RepairError("replacement Gallery changed")
 
-    def verify_old():
-        check_candidate_metadata(studio, new_gallery)
+    def verify_old(*, expected_files=None, expected_audios=None, expected_config=None):
+        check_candidate_metadata(studio, new_gallery, expected_files=expected_files,
+                                 expected_audios=expected_audios, expected_config=expected_config)
         if (_files(studio, old_gallery) != prepared["files"] or _audio(studio, old_gallery) != prepared["old_audio"]
                 or _config(studio, old_gallery) != prepared["old_config"]):
             raise RepairError("original Gallery changed")
@@ -99,7 +101,7 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
             current_old = _target(studio, course_id, chapter, section, old_gallery)
             if current_old[3] != created or current_old[4] != old_target[4]:
                 raise RepairError("replacement unit changed during image upload")
-            verify_old()
+            verify_old(expected_files=uploaded, expected_audios=[], expected_config=state["initial_config"])
             path = Path(row["isolated_file"])
             state.update({"stage": "upload_pending", "pending_file": path.name})
             _write(state_path, state)
@@ -108,9 +110,10 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
             state.update({"stage": "uploading", "pending_file": None})
             _write(state_path, state)
         expected_files = [{"id": row["asset_id"], "filename": Path(row["isolated_file"]).name} for row in mapping]
+        verify_old(expected_files=uploaded, expected_audios=[], expected_config=state["initial_config"])
         if uploaded != expected_files:
             _replace(lambda: _files(studio, new_gallery), lambda value: studio.order_images(new_gallery, [item["id"] for item in value]), uploaded, expected_files)
-        verify_old()
+        verify_old(expected_files=expected_files, expected_audios=[], expected_config=state["initial_config"])
         state["stage"] = "audio_upload_pending"
         _write(state_path, state)
         try:
@@ -144,13 +147,14 @@ def resume_replacement(studio, course_id, chapter, section, output, images, prep
                 raise RepairError("new Gallery audio is unreadable")
             return rows
         _replace(bindings, lambda value: studio.bind_audio(new_gallery, value[0]), [], [new_audio])
+        verify_old(expected_files=expected_files, expected_audios=[new_audio])
         def read_config():
             value = _retry_read(lambda: studio.get_play_config(new_gallery)).get("play_config")
             if not isinstance(value, dict):
                 raise RepairError("new Gallery config is unreadable")
             return value
         _replace(read_config, lambda value: studio.update_play_config(new_gallery, value), state["initial_config"], prepared["config"])
-        verify_old()
+        verify_old(expected_files=expected_files, expected_audios=[new_audio], expected_config=prepared["config"])
         verify_new()
         state["stage"] = "verified"
         _write(state_path, state)

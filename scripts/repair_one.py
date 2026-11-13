@@ -204,7 +204,7 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
     other_components = [x for x in _children(vertical) if x.get("category") != "imagesgallery"]
     siblings = [({"target_vertical": ids[1], "other_components": other_components} if x is vertical else x)
                 for x in _children(sequential)]
-    def content(node):
+    def checked_children(node):
         if not isinstance(node, dict):
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         kind = node.get("category")
@@ -222,6 +222,12 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         elif has_children is False and info["children"]:
             raise UnconfirmedRepairError("the sequential structure is incomplete")
+        return _children(node)
+
+    def content(node):
+        descendants = checked_children(node)
+        kind = node.get("category")
+        identity = locator(node)
         try:
             details = studio.get_block_details(identity)
         except Exception as exc:
@@ -241,8 +247,16 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
                     or not isinstance(config, dict) or not isinstance(config.get("play_config"), dict)):
                 raise UnconfirmedRepairError("other Gallery state is unreadable")
             result.update({"files": files, "audios": audios["audios"], "play_config": config["play_config"]})
-        result["children"] = [content(child) for child in _children(node)
-                              if not (node is vertical and child.get("category") == "imagesgallery")]
+        result["children"] = []
+        for child in descendants:
+            if node is vertical and isinstance(child, dict) and child.get("category") == "imagesgallery":
+                gallery_children = checked_children(child)
+                # The local ImageGallery contract is a leaf; a different or
+                # incomplete shape cannot be checked using its read handlers.
+                if child.get("has_children") is not False or gallery_children:
+                    raise UnconfirmedRepairError("the target Gallery structure is incomplete")
+            else:
+                result["children"].append(content(child))
         return result
 
     snapshot = {"structure": siblings, "content": content(sequential)}
@@ -306,11 +320,14 @@ def _publication(studio, course_id, sequential_id):
     return _retry_read(lambda: studio.get_course_publication_structure(course_id).get(sequential_id, {}))
 
 
-def _verify_gallery(studio, course_id, chapter, section, target, files, audio, config):
+def _verify_gallery(studio, course_id, chapter, section, target, files, audio, config, *, isolated=False):
     gallery = target[2]
     if (_target(studio, course_id, chapter, section) != target or _files(studio, gallery) != files
             or _audio(studio, gallery) != audio or _config(studio, gallery) != config):
         raise RepairError("Gallery or sequential changed before publication")
+    if isolated:
+        from .image_upload import check_candidate_metadata
+        check_candidate_metadata(studio, gallery, expected_files=files, expected_audios=[audio], expected_config=config)
 
 
 def _replace(read, write, original, desired):
@@ -442,7 +459,8 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 _write(state_path, saved)
                 for _ in range(3):
                     _verify_gallery(studio, course_id, chapter_name, section["section_title"], resumed_target,
-                                    resumed_files, resumed_audio, saved["config"])
+                                    resumed_files, resumed_audio, saved["config"],
+                                    isolated=saved.get("isolated_images", saved.get("replacement", False)))
                     publication = _publication(studio, course_id, sequential_id)
                     if publication.get("published") is True and publication.get("has_changes") is False:
                         break
@@ -456,10 +474,9 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     publication = _publication(studio, course_id, sequential_id)
                     if publication.get("published") is not True or publication.get("has_changes") is not False:
                         raise RepairError("sequential publication not confirmed")
-                if (_target(studio, course_id, chapter_name, section["section_title"]) != resumed_target
-                        or _files(studio, gallery_id) != resumed_files or _audio(studio, gallery_id) != resumed_audio
-                        or _config(studio, gallery_id) != saved["config"]):
-                    raise RepairError("Gallery changed after publication")
+                _verify_gallery(studio, course_id, chapter_name, section["section_title"], resumed_target,
+                                resumed_files, resumed_audio, saved["config"],
+                                isolated=saved.get("isolated_images", saved.get("replacement", False)))
                 match_description = "isolated local uploads" if saved.get("isolated_images", saved.get("replacement")) else "filename/count/order only"
                 saved.update({"stage": "complete", "target": resumed_target, "files": resumed_files,
                               "audio": resumed_audio, "image_match": match_description})
@@ -499,6 +516,9 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                             and _audio(studio, current[2]) == saved["audio"]
                             and _config(studio, current[2]) == saved["config"]
                             and publication.get("published") is True and publication.get("has_changes") is False):
+                        _verify_gallery(studio, course_id, chapter_name, section["section_title"], current,
+                                        saved["files"], saved["audio"], saved["config"],
+                                        isolated=saved.get("isolated_images", saved.get("replacement", False)))
                         report.update({"status": "success", "phase": "complete", "sequential": current[0],
                                        "vertical": current[1], "gallery": current[2],
                                        "image_match": saved["image_match"], "reused": True})
@@ -642,15 +662,15 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         _write(state_path, state)
         for _ in range(3):
             _verify_gallery(studio, course_id, chapter_name, section["section_title"], target,
-                            files, new_audio, new_config)
+                            files, new_audio, new_config, isolated=replacing or matching_replaced_images)
             try:
                 studio.publish_sequential(sequential_id)
             except Exception:
                 pass
             published = _publication(studio, course_id, sequential_id)
             if published.get("published") is True and published.get("has_changes") is False:
-                if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files or _audio(studio, gallery_id) != new_audio or _config(studio, gallery_id) != new_config:
-                    raise RepairError("Gallery changed after publication")
+                _verify_gallery(studio, course_id, chapter_name, section["section_title"], target,
+                                files, new_audio, new_config, isolated=replacing or matching_replaced_images)
                 break
             if published.get("published") not in (True, False) or published.get("has_changes") not in (True, False):
                 raise RepairError("sequential publication state is unreadable")

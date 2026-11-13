@@ -60,15 +60,16 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
                   "initial_config": initial_config})
     _write(state_path, state)
 
-    def check_original(expected_children):
+    def check_original(expected_children, *, expected_files=None, expected_audios=None, expected_config=None):
         current = original_target()
         if (current[:3] != target[:3] or current[3] != expected_children or current[4] != sibling_snapshot
                 or _files(studio, old_gallery) != old_files or _audio(studio, old_gallery) != old_audio
                 or _config(studio, old_gallery) != old_config):
             raise RepairError("original Gallery or unit changed during replacement")
-        check_candidate_metadata(studio, new_gallery)
+        check_candidate_metadata(studio, new_gallery, expected_files=expected_files,
+                                 expected_audios=expected_audios, expected_config=expected_config)
 
-    check_original(current_children)
+    check_original(current_children, expected_files=[], expected_audios=[], expected_config=initial_config)
     uploaded = _files(studio, new_gallery)
     if uploaded:
         raise RepairError("new Gallery was not empty")
@@ -80,14 +81,14 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         _write(image_map_path, mapping)
         state.update({"stage": "uploading", "pending_file": None})
         _write(state_path, state)
-        check_original(current_children)
+        check_original(current_children, expected_files=uploaded, expected_audios=[], expected_config=initial_config)
 
     desired_files = [{"id": row["asset_id"], "filename": Path(row["isolated_file"]).name} for row in mapping]
     if uploaded != desired_files:
         _replace(lambda: _files(studio, new_gallery),
                  lambda value: studio.order_images(new_gallery, [item["id"] for item in value]),
                  uploaded, desired_files)
-    check_original(current_children)
+    check_original(current_children, expected_files=desired_files, expected_audios=[], expected_config=initial_config)
 
     state["stage"] = "audio_upload_pending"
     _write(state_path, state)
@@ -108,6 +109,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
 
     state.update({"stage": "audio_uploaded", "audio": new_audio})
     _write(state_path, state)
+    check_original(current_children, expected_files=desired_files, expected_audios=[], expected_config=initial_config)
 
     def bindings():
         payload = _retry_read(lambda: studio.get_audios(new_gallery))
@@ -119,6 +121,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     if bindings() != []:
         raise RepairError("new Gallery unexpectedly has audio")
     _replace(bindings, lambda value: studio.bind_audio(new_gallery, value[0]), [], [new_audio])
+    check_original(current_children, expected_files=desired_files, expected_audios=[new_audio], expected_config=initial_config)
     def new_gallery_config():
         payload = _retry_read(lambda: studio.get_play_config(new_gallery))
         value = payload.get("play_config") if isinstance(payload, dict) else None
@@ -127,7 +130,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         return value
 
     _replace(new_gallery_config, lambda value: studio.update_play_config(new_gallery, value), initial_config, new_config)
-    check_original(current_children)
+    check_original(current_children, expected_files=desired_files, expected_audios=[new_audio], expected_config=new_config)
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
         raise RepairError("new Gallery contents did not pass readback")
     state.update({"stage": "verified", "audio": new_audio})
@@ -146,7 +149,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     state["stage"] = "reorder_pending"
     _write(state_path, state)
     _replace(children, lambda value: studio.reorder_children(vertical, [identity for _, identity in value]), current_children, moved)
-    check_original(moved)
+    check_original(moved, expected_files=desired_files, expected_audios=[new_audio], expected_config=new_config)
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
         raise RepairError("new Gallery changed before replacement")
     final_children = tuple(child for child in moved if child != ("imagesgallery", old_gallery))
@@ -158,6 +161,8 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         raise RepairError("replacement structure could not be confirmed")
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
         raise RepairError("replacement Gallery changed after deletion")
+    check_candidate_metadata(studio, new_gallery, expected_files=desired_files,
+                             expected_audios=[new_audio], expected_config=new_config)
     state["stage"] = "replaced"
     _write(state_path, state)
     return final_target, desired_files, new_audio

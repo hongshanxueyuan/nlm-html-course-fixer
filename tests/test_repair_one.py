@@ -54,7 +54,7 @@ class Studio:
             {"category": "chapter", "display_name": "第一章", "child_info": {"children": [
                 {"category": "sequential", "display_name": "1.2 测试", "id": SEQUENTIAL, "child_info": {"children": [
                     {"category": "vertical", "display_name": "赋能内容", "id": VERTICAL, "child_info": {"children": [
-                        {"category": "imagesgallery", "id": GALLERY},
+                        {"category": "imagesgallery", "id": GALLERY, "has_children": False},
                         {"category": "html", "display_name": "本节要点", "id": SUMMARY},
                     ]}},
                 ]}},
@@ -271,6 +271,22 @@ def test_changed_sibling_component_metadata_is_not_published(tmp_path):
 
     result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=studio)
     assert result["status"] != "success" and not studio.published
+
+
+def test_target_gallery_with_unreadable_children_is_not_published(tmp_path):
+    class IncompleteGallery(Studio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            unit = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
+            unit["child_info"]["children"][0]["has_children"] = True
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = IncompleteGallery()
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=studio)
+    assert result["status"] == "unconfirmed" and result["phase"] == "target"
+    assert not studio.published and studio.audios == [{"document_id": "old.mp3", "file_name": "old.mp3"}]
 
 
 def test_source_course_json_can_use_original_export_filename(tmp_path):

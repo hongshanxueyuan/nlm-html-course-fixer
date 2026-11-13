@@ -509,6 +509,29 @@ def test_completed_replacement_with_changed_isolated_artifact_is_not_reused(tmp_
     assert len(studio.uploaded_paths) == 3 and studio.deleted == [GALLERY]
 
 
+def test_completed_replacement_with_changed_metadata_is_not_reused(tmp_path):
+    class ChangedStudio(ReplacementStudio):
+        changed = False
+
+        def get_block_details(self, locator):
+            details = super().get_block_details(locator)
+            if locator == NEW_GALLERY and self.changed:
+                details["metadata"]["content_names"] = ["concurrent-change.jpg"]
+            return details
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = ChangedStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    assert run_batch(package, TARGET, package / "repair", **options)["sections"][0]["status"] == "success"
+    studio.changed = True
+    result = run_batch(package, TARGET, package / "repair", **options)
+    assert result["sections"][0]["status"] == "unconfirmed"
+    assert len(studio.uploaded_paths) == 3 and studio.deleted == [GALLERY]
+
+
 def test_gallery_credentials_are_not_written_to_run_state(tmp_path):
     package = tmp_path / "package"
     package_at(package)
