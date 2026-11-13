@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlparse
 
 
 class RepairError(Exception):
+    pass
+
+
+class RestoredRepairError(RepairError):
     pass
 
 
@@ -33,6 +40,58 @@ def _nlm():
 
 def _json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _input_digest(target_url, source_id, chapter, section, block, gallery, images, force_replace):
+    payload = {"target_url": target_url, "source_id": source_id, "chapter": chapter,
+               "section": section, "block": block, "gallery": gallery,
+               "images": [{"path": str(image), "sha256": _sha256(image)} for image in images],
+               "force_replace": force_replace}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _image_digests(images):
+    return [{"path": str(image), "sha256": _sha256(image)} for image in images]
+
+
+def _verify_isolated_mapping(output, state):
+    if not state.get("isolated_images", state.get("replacement")):
+        return
+    try:
+        mapping = _json(output / "image-map.json")
+        prior_images = state["images"]
+        files = state["files"]
+        if not isinstance(mapping, list) or len(mapping) != len(prior_images) or len(mapping) != len(files):
+            raise ValueError
+        for row, image, remote in zip(mapping, prior_images, files):
+            path = Path(row["isolated_file"]).resolve()
+            if (row["source"] != image["path"] or not path.is_relative_to((output / "isolated-images").resolve())
+                    or not path.is_file() or _sha256(path) != image["sha256"]
+                    or row["asset_id"] != remote["id"] or path.name != remote["filename"]):
+                raise ValueError
+    except (KeyError, TypeError, OSError, ValueError) as exc:
+        raise RepairError("isolated image mapping or artifacts changed") from exc
+
+
+def _assert_no_credentials(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if any(word in normalized for word in ("password", "secret", "token", "cookie", "authorization", "accesskey")) and item:
+                raise RepairError("Gallery configuration contains credential fields and cannot be checkpointed")
+            _assert_no_credentials(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_no_credentials(item)
 
 
 def _write(path, data):
@@ -218,14 +277,151 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
     old_audio = new_audio = old_config = new_config = None
     gallery_id = None
     replacing = False
+    prior_complete = None
     try:
         section, source_id, chapter_name, block, gallery, images, voice = _load_inputs(package, section_id, repair_dir)
         report["source_course_id"] = source_id
+        input_digest = _input_digest(target_url, source_id, chapter_name, section, block, gallery, images, force_replace)
         common = _nlm()
         source = common._clean_page_body(common._render_html(block["text"]))
         cover_title = common.strip_section_prefix(section["section_title"])
         body_parts = common._remove_duplicate_cover_heading([source], title=cover_title)
         body = body_parts[0] if body_parts else ""
+        state_path = output / "run-state.json"
+        if state_path.is_file():
+            report["status"] = "unconfirmed"
+            saved = _json(state_path)
+            if not isinstance(saved, dict) or saved.get("stage") not in {"prepared", "audio_upload_pending", "audio_uploaded", "publish_pending", "complete"}:
+                raise RepairError("saved run stage is unreadable")
+            if (saved.get("stage") == "prepared" and saved.get("input_digest") != input_digest
+                    and not (output / "replacement-state.json").exists()):
+                report["status"] = "unconfirmed"
+                current = _target(studio, course_id, chapter_name, section["section_title"])
+                if (json.loads(json.dumps(current)) != saved["target"] or _files(studio, current[2]) != saved["files"]
+                        or _audio(studio, current[2]) != saved["old_audio"]
+                        or _config(studio, current[2]) != saved["old_config"]):
+                    raise RepairError("target changed since preparation")
+                history = output / "history"
+                history.mkdir(exist_ok=True)
+                state_path.replace(history / f"{uuid.uuid4().hex}-run-state.json")
+                saved = {}
+                report["status"] = "failed"
+            if saved.get("stage") in {"prepared", "audio_upload_pending", "audio_uploaded", "publish_pending"}:
+                report.update({"status": "unconfirmed", "phase": "resume", "recovery": "unconfirmed"})
+                if saved.get("replacement"):
+                    report["replacement"] = True
+                if saved.get("input_digest") != input_digest:
+                    raise RepairError("input changed since preparation")
+                manifest_path = output / "imagesgallery.json"
+                saved_audio = Path(saved["audio_path"]).resolve()
+                if (not saved_audio.is_relative_to((output / "audio").resolve()) or not saved_audio.is_file()
+                        or not manifest_path.is_file() or _sha256(saved_audio) != saved["audio_sha256"]
+                        or _sha256(manifest_path) != saved["manifest_sha256"]):
+                    raise RepairError("artifacts changed since preparation")
+                pages = common._normalize_explicit_page_content(saved["pages"])
+                common._validate_html_pagination_source_coverage(body, pages[1:])
+                if _validate_audio(manifest_path, pages, saved_audio) != saved["config"]["time_config"]:
+                    raise RepairError("timeline differs from checked audio")
+                if saved.get("replacement"):
+                    if (output / "replacement-state.json").exists():
+                        from .resume_replacement import resume_replacement
+                        resumed_target, resumed_files, resumed_audio = resume_replacement(
+                            studio, course_id, chapter_name, section["section_title"], output, images, saved)
+                    else:
+                        from .replacement import replace_gallery
+                        old_target = tuple(saved["target"][:3]) + (tuple(tuple(row) for row in saved["target"][3]),)
+                        resumed_target, resumed_files, resumed_audio = replace_gallery(
+                            studio, course_id, chapter_name, section["section_title"], old_target,
+                            saved["files"], saved["old_audio"], saved["old_config"], saved["config"],
+                            images, saved_audio, output)
+                else:
+                    from .resume_inplace import resume_inplace
+                    resumed_target, resumed_files, resumed_audio = resume_inplace(
+                        studio, course_id, chapter_name, section["section_title"], output, saved)
+                sequential_id, vertical_id, gallery_id, children = resumed_target
+                report.update({"sequential": sequential_id, "vertical": vertical_id, "gallery": gallery_id})
+                saved.update({"stage": "publish_pending", "audio": resumed_audio})
+                _write(state_path, saved)
+                for _ in range(3):
+                    publication = studio.get_course_publication_structure(course_id).get(sequential_id, {})
+                    if publication.get("published") is True and publication.get("has_changes") is False:
+                        break
+                    if publication.get("published") not in (True, False) or publication.get("has_changes") not in (True, False):
+                        raise RepairError("sequential publication state is unreadable")
+                    try:
+                        studio.publish_sequential(sequential_id)
+                    except Exception:
+                        pass
+                else:
+                    publication = studio.get_course_publication_structure(course_id).get(sequential_id, {})
+                    if publication.get("published") is not True or publication.get("has_changes") is not False:
+                        raise RepairError("sequential publication not confirmed")
+                if (_target(studio, course_id, chapter_name, section["section_title"]) != resumed_target
+                        or _files(studio, gallery_id) != resumed_files or _audio(studio, gallery_id) != resumed_audio
+                        or _config(studio, gallery_id) != saved["config"]):
+                    raise RepairError("Gallery changed after publication")
+                match_description = "isolated local uploads" if saved.get("isolated_images", saved.get("replacement")) else "filename/count/order only"
+                saved.update({"stage": "complete", "target": resumed_target, "files": resumed_files,
+                              "audio": resumed_audio, "image_match": match_description})
+                _write(state_path, saved)
+                report.update({"status": "success", "phase": "complete", "image_match": match_description,
+                               "recovery": "resumed and verified"})
+                _write(output / "report.json", report)
+                return report
+            if saved.get("stage") == "complete":
+                report["status"] = "unconfirmed"
+                _verify_isolated_mapping(output, saved)
+            if saved.get("stage") == "complete" and saved.get("input_digest") != input_digest:
+                report["status"] = "unconfirmed"
+                current = _target(studio, course_id, chapter_name, section["section_title"])
+                publication = studio.get_course_publication_structure(course_id).get(current[0], {})
+                if (json.loads(json.dumps(current)) != saved["target"] or _files(studio, current[2]) != saved["files"]
+                        or _audio(studio, current[2]) != saved["audio"] or _config(studio, current[2]) != saved["config"]
+                        or publication.get("published") is not True or publication.get("has_changes") is not False):
+                    raise RepairError("completed section changed since its verified snapshot")
+                prior_complete = saved
+                report["status"] = "failed"
+            if saved.get("stage") == "complete" and saved.get("input_digest") == input_digest:
+                manifest_path = output / "imagesgallery.json"
+                saved_audio = Path(saved["audio_path"]).resolve()
+                if (saved_audio.is_relative_to((output / "audio").resolve())
+                        and manifest_path.is_file() and saved_audio.is_file()
+                        and _sha256(manifest_path) == saved.get("manifest_sha256")
+                        and _sha256(saved_audio) == saved.get("audio_sha256")):
+                    pages = common._normalize_explicit_page_content(saved["pages"])
+                    common._validate_html_pagination_source_coverage(body, pages[1:])
+                    if _validate_audio(manifest_path, pages, saved_audio) != saved["config"]["time_config"]:
+                        raise RepairError("saved timeline differs from checked audio")
+                    current = _target(studio, course_id, chapter_name, section["section_title"])
+                    publication = studio.get_course_publication_structure(course_id).get(current[0], {})
+                    if (json.loads(json.dumps(current)) == saved["target"]
+                            and _files(studio, current[2]) == saved["files"]
+                            and _audio(studio, current[2]) == saved["audio"]
+                            and _config(studio, current[2]) == saved["config"]
+                            and publication.get("published") is True and publication.get("has_changes") is False):
+                        report.update({"status": "success", "phase": "complete", "sequential": current[0],
+                                       "vertical": current[1], "gallery": current[2],
+                                       "image_match": saved["image_match"], "reused": True})
+                        if saved.get("replacement"):
+                            report["replacement"] = True
+                        _write(output / "report.json", report)
+                        return report
+                    old = _json(output / "old-state.json")
+                    if (saved.get("replacement") or json.loads(json.dumps(current[3])) != old["children"]
+                            or _files(studio, current[2]) != old["files"]
+                            or _audio(studio, current[2]) != old["audio"]
+                            or _config(studio, current[2]) != old["play_config"]):
+                        report["status"] = "unconfirmed"
+                        raise RepairError("completed section changed since its verified snapshot")
+                    report["status"] = "failed"
+                else:
+                    report["status"] = "unconfirmed"
+                    current = _target(studio, course_id, chapter_name, section["section_title"])
+                    if (json.loads(json.dumps(current)) != saved["target"] or _files(studio, current[2]) != saved["files"]
+                            or _audio(studio, current[2]) != saved["audio"] or _config(studio, current[2]) != saved["config"]):
+                        raise RepairError("completed section changed since its verified snapshot")
+                    prior_complete = saved
+                    report["status"] = "failed"
         request = {"source": source, "body": body, "cover_title": cover_title, "old_pages": section.get("page_content", []), "images": [str(p) for p in images], "count": len(images)}
         report["phase"] = "pagination"
         pages = None
@@ -246,14 +442,30 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
             raise RepairError("pagination or review did not pass")
         report["phase"] = "target"
         if (output / "replacement-state.json").exists():
-            report["status"] = "unconfirmed"
-            raise RepairError("an earlier Gallery replacement requires reconciliation before rerunning")
+            if not prior_complete:
+                report["status"] = "unconfirmed"
+                raise RepairError("an earlier Gallery replacement requires reconciliation before rerunning")
+            history = output / "history"
+            history.mkdir(exist_ok=True)
+            nonce = uuid.uuid4().hex
+            for name in ("replacement-state.json", "image-map.json"):
+                old_path = output / name
+                if old_path.exists():
+                    if name == "image-map.json":
+                        shutil.copyfile(old_path, history / f"{nonce}-{name}")
+                    else:
+                        old_path.replace(history / f"{nonce}-{name}")
         target = _target(studio, course_id, chapter_name, section["section_title"])
         sequential_id, vertical_id, gallery_id, children = target
         report.update({"sequential": sequential_id, "vertical": vertical_id, "gallery": gallery_id})
         files = _files(studio, gallery_id)
-        replacing = force_replace or [x["filename"] for x in files] != [p.name for p in images]
+        same_previous_images = bool(prior_complete and prior_complete.get("images") == _image_digests(images))
+        matching_replaced_images = bool(same_previous_images and prior_complete.get("isolated_images", prior_complete.get("replacement")) and files == prior_complete["files"])
+        newly_forced = force_replace and not (matching_replaced_images and prior_complete.get("force_replace"))
+        replacing = (newly_forced or (prior_complete is not None and not same_previous_images)
+                     or (not matching_replaced_images and [x["filename"] for x in files] != [p.name for p in images]))
         old_audio, old_config = _audio(studio, gallery_id), _config(studio, gallery_id)
+        _assert_no_credentials(old_config)
         _write(output / "old-state.json", {"audio": old_audio, "play_config": old_config, "files": files, "children": children})
         items = []
         for index, (old, image, text) in enumerate(zip(gallery["items"], images, pages), start=1):
@@ -273,6 +485,12 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         new_config["time_config"] = time_config
         if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files or _audio(studio, gallery_id) != old_audio or _config(studio, gallery_id) != old_config:
             raise RepairError("target changed before update")
+        _write(state_path, {"stage": "prepared", "input_digest": input_digest, "target": target,
+                            "files": files, "old_audio": old_audio, "old_config": old_config,
+                            "config": new_config, "pages": pages, "audio_path": str(Path(audio_path).resolve()),
+                            "audio_sha256": _sha256(audio_path), "manifest_sha256": _sha256(manifest_path),
+                            "replacement": replacing, "isolated_images": replacing or matching_replaced_images,
+                            "images": _image_digests(images), "force_replace": force_replace})
         report["phase"] = "update"
         if replacing:
             from .replacement import replace_gallery
@@ -284,9 +502,26 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
             sequential_id, vertical_id, gallery_id, children = target
             report.update({"gallery": gallery_id, "replacement": True})
         else:
-            new_audio = studio.upload_audio(gallery_id, audio_path)
+            state = _json(state_path)
+            state["stage"] = "audio_upload_pending"
+            _write(state_path, state)
+            try:
+                new_audio = studio.upload_audio(gallery_id, audio_path)
+            except Exception as exc:
+                report["status"] = "unconfirmed"
+                try:
+                    _target(studio, course_id, chapter_name, section["section_title"])
+                    _files(studio, gallery_id)
+                    _audio(studio, gallery_id)
+                    _config(studio, gallery_id)
+                except Exception:
+                    pass
+                raise RepairError("audio upload outcome is unconfirmed") from exc
             if not isinstance(new_audio, dict) or not new_audio.get("document_id") or not new_audio.get("file_name") or new_audio == old_audio:
+                report["status"] = "unconfirmed"
                 raise RepairError("new audio identity is missing")
+            state.update({"stage": "audio_uploaded", "audio": new_audio})
+            _write(state_path, state)
             if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files:
                 report["status"] = "unconfirmed"
                 raise RepairError("target changed during audio upload")
@@ -302,6 +537,9 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 raise RepairError("Gallery verification failed")
         report["phase"] = "publish"
         report["status"] = "unconfirmed"
+        state = _json(state_path)
+        state.update({"stage": "publish_pending", "audio": new_audio})
+        _write(state_path, state)
         for _ in range(3):
             try:
                 studio.publish_sequential(sequential_id)
@@ -318,9 +556,18 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 raise RepairError("target changed while publication was pending")
         else:
             raise RepairError("sequential publication not confirmed")
-        report.update({"status": "success", "phase": "complete", "image_match": "isolated local uploads" if replacing else "filename/count/order only"})
+        report.update({"status": "success", "phase": "complete", "image_match": "isolated local uploads" if replacing or matching_replaced_images else "filename/count/order only"})
+        _write(state_path, {"stage": "complete", "input_digest": input_digest, "target": target,
+                            "files": files, "audio": new_audio, "config": new_config, "pages": pages,
+                            "audio_path": str(Path(audio_path).resolve()), "audio_sha256": _sha256(audio_path),
+                            "manifest_sha256": _sha256(manifest_path), "replacement": replacing,
+                            "image_match": report["image_match"], "isolated_images": replacing or matching_replaced_images,
+                            "images": _image_digests(images),
+                            "force_replace": force_replace})
     except Exception as exc:
         report["reason"] = str(exc) if isinstance(exc, RepairError) else type(exc).__name__
+        if isinstance(exc, RestoredRepairError):
+            report.update({"status": "failed", "recovery": "restored and verified"})
         if replacing:
             report.update({"replacement": True, "recovery": "not attempted"})
             state_path = output / "replacement-state.json"

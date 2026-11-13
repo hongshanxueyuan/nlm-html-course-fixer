@@ -5,23 +5,27 @@ import json
 from pathlib import Path
 
 from .production import AgentBridge, Studio, synthesize
-from .repair_one import repair_one
+from .batch_repair import run_batch
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Repair one HTML section in its existing Studio Gallery")
+    parser = argparse.ArgumentParser(description="Repair selected HTML sections in a Studio course")
     parser.add_argument("--package", required=True)
     parser.add_argument("--studio-url", required=True)
-    parser.add_argument("--section", required=True)
-    parser.add_argument("--repair-dir", required=True)
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--section", action="append", help="Section identifier; repeat for multiple sections")
+    scope.add_argument("--chapter", help="Exact source chapter name")
+    scope.add_argument("--first-chapter", action="store_true", help="Select only the first source chapter")
+    parser.add_argument("--repair-dir", help="Dedicated directory inside the course package")
     parser.add_argument("--tenant-config", required=True)
     parser.add_argument("--force-replace", action="store_true", help="Replace Gallery when its image bytes are known to differ despite matching filenames")
     args = parser.parse_args()
     studio = Studio(args.studio_url, args.tenant_config)
-    bridge = AgentBridge(Path(args.repair_dir) / ".agent-bridge" / args.section)
-    result = repair_one(args.package, args.studio_url, args.section, args.repair_dir,
-                        split=bridge.split, review=bridge.review, synthesize=synthesize, studio=studio,
-                        force_replace=args.force_replace)
+    repair_dir = Path(args.repair_dir) if args.repair_dir else Path(args.package) / "nlm-html-course-fixer"
+    result = run_batch(args.package, args.studio_url, repair_dir, sections=args.section,
+                       chapter=args.chapter, first_chapter=args.first_chapter, studio=studio,
+                       agent_factory=lambda section: AgentBridge(repair_dir / ".agent-bridge" / section),
+                       synthesize=synthesize, force_replace=args.force_replace)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "success" else 1
 

@@ -109,6 +109,9 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
             pass
         raise RepairError("audio upload outcome is unconfirmed") from exc
 
+    state.update({"stage": "audio_uploaded", "audio": new_audio})
+    _write(state_path, state)
+
     def bindings():
         payload = studio.get_audios(new_gallery)
         rows = payload.get("audios") if isinstance(payload, dict) else None
@@ -127,6 +130,8 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         return value
 
     initial_config = new_gallery_config()
+    state["initial_config"] = initial_config
+    _write(state_path, state)
     _replace(new_gallery_config, lambda value: studio.update_play_config(new_gallery, value), initial_config, new_config)
     check_original(current_children)
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:

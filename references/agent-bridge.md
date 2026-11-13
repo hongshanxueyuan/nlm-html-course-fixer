@@ -1,6 +1,6 @@
 # 隔离子 Agent 交接
 
-主 Agent 从正在运行的 `scripts.run_repair` 读取每一行 JSON。`agent_request` 包含 `split` 或 `review`、输入 `request` 路径和输出 `response` 路径。每个请求启动一个新 Agent，只传这两个路径、本文件的规则和 `nlm-course-slides/references/html-pagination-rules.md` 路径；不传其他小节或父对话内容。Agent 读取请求和该请求列出的本地图片，写 JSON 到临时文件后重命名为指定响应路径，避免半写入。主 Agent 持续等待程序的新请求或最终报告。
+主 Agent 从正在运行的 `scripts.run_repair` 读取每一行 JSON。`agent_request` 包含 `split` 或 `review`、输入 `request` 路径和输出 `response` 路径。每个请求以 `fork_turns=none` 启动一个新 Agent，只传这两个路径、本文件的规则和 `nlm-course-slides/references/html-pagination-rules.md` 路径；不传其他小节或父对话内容。Agent 读取请求和该请求列出的本地图片，写 JSON 到临时文件后重命名为指定响应路径，避免半写入。批次按小节串行，主 Agent 在收到本请求响应后再处理下一请求；所有切分和复核 Agent 合计不得超过 3。主 Agent 持续等待程序的新请求或最终报告。
 
 ## split
 
