@@ -204,20 +204,30 @@ def _read_target(studio, course_id, chapter_name, section_title, gallery_locator
     other_components = [x for x in _children(vertical) if x.get("category") != "imagesgallery"]
     siblings = [({"target_vertical": ids[1], "other_components": other_components} if x is vertical else x)
                 for x in _children(sequential)]
+
+    def component_label(kind, identity):
+        category = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", kind) else "unknown"
+        pattern = re.escape(prefix) + r"[A-Za-z0-9_-]+\+block@[A-Za-z0-9_.~-]+"
+        if isinstance(identity, str) and re.fullmatch(pattern, identity):
+            return f"{category} ({identity})"
+        return category
+
     def checked_children(node):
         if not isinstance(node, dict):
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         kind = node.get("category")
         identity = locator(node)
         if kind not in {"sequential", "vertical", "html", "problem", "imagesgallery"} or not identity:
-            raise UnconfirmedRepairError("a component type cannot be checked with the available Studio reads")
+            raise UnconfirmedRepairError(f"component cannot be checked: {component_label(kind, identity)}")
         info = node.get("child_info")
         has_children = node.get("has_children")
         if "has_children" in node and not isinstance(has_children, bool):
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         if info is None:
             if has_children is True or (kind in {"sequential", "vertical"} and has_children is not False):
-                raise UnconfirmedRepairError("the sequential structure is incomplete")
+                raise UnconfirmedRepairError(
+                    f"the sequential structure is incomplete: child list unavailable for {component_label(kind, identity)}"
+                )
         elif not isinstance(info, dict) or not isinstance(info.get("children"), list):
             raise UnconfirmedRepairError("the sequential structure is incomplete")
         elif has_children is False and info["children"]:

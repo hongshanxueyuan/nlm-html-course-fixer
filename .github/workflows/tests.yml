@@ -1,0 +1,54 @@
+name: Offline tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      NLM_COURSE_SLIDES_ROOT: ${{ github.workspace }}/.dependencies/nlm-course-slides
+      PPT_TO_IMAGESGALLERY_ROOT: ${{ github.workspace }}/.dependencies/ppt-to-imagesgallery
+      NLM_COURSE_AUDITOR_ROOT: ${{ github.workspace }}/.dependencies/nlm-course-auditor
+      STUDIO_IMAGEGALLERY_PUBLISH_ROOT: ${{ github.workspace }}/.dependencies/studio-imagegallery-publish
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: hongshanxueyuan/nlm-course-slides
+          ref: db6913399ba6a811ab83c901d7067685393e9db0
+          path: .dependencies/nlm-course-slides
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: hongshanxueyuan/ppt-to-imagesgallery
+          ref: c04c6276cba45fbaec13715c8dcd421dbb74d2eb
+          path: .dependencies/ppt-to-imagesgallery
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: hongshanxueyuan/nlm-course-auditor
+          ref: e2bbc468269773c63f4fa853a11d50c0a5b1349a
+          path: .dependencies/nlm-course-auditor
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: hongshanxueyuan/studio-imagegallery-publish
+          ref: c7ac9c9f6c5952db6d41d993f79e9cfbf41779c1
+          path: .dependencies/studio-imagegallery-publish
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run offline tests
+        run: python -m pytest -q

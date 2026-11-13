@@ -9,6 +9,11 @@ SEQUENTIAL = "block-v1:FIRAx+TARGET+20261113+type@sequential+block@section"
 VERTICAL = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unit"
 GALLERY = "block-v1:FIRAx+TARGET+20261113+type@imagesgallery+block@gallery"
 SUMMARY = "block-v1:FIRAx+TARGET+20261113+type@html+block@summary"
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def fixture(name):
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,23 +55,14 @@ class Studio:
         self.published = False
 
     def get_course_structure(self, course_id):
-        return {"category": "course", "child_info": {"children": [
-            {"category": "chapter", "display_name": "第一章", "child_info": {"children": [
-                {"category": "sequential", "display_name": "1.2 测试", "id": SEQUENTIAL, "child_info": {"children": [
-                    {"category": "vertical", "display_name": "赋能内容", "id": VERTICAL, "child_info": {"children": [
-                        {"category": "imagesgallery", "id": GALLERY, "has_children": False},
-                        {"category": "html", "display_name": "本节要点", "id": SUMMARY},
-                    ]}},
-                ]}},
-            ]}},
-        ]}}
+        return fixture("studio_concise.json")
 
     def get_block_details(self, locator):
         category = locator.split("+type@", 1)[1].split("+", 1)[0] if "+type@" in locator else ("vertical" if locator == "other-unit" else "html")
         return {"id": locator, "category": category, "data": "", "metadata": {}}
 
     def get_files(self, locator):
-        return {"files": [{"id": f"asset-{n}", "filename": f"{n}.jpg"} for n in range(1, 4)], "total_count": 3}
+        return fixture("studio_gallery_files.json")
 
     def get_play_config(self, locator):
         return {"play_config": copy.deepcopy(self.config)}

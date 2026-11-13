@@ -1,0 +1,5 @@
+pytest>=8,<10
+requests>=2.31,<3
+markdownify>=1,<2
+markdown-it-py>=3,<5
+openai>=1.66,<4

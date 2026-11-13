@@ -1,0 +1,52 @@
+{
+  "id": "block-v1:FIRAx+TARGET+20261113+type@course+block@course",
+  "display_name": "测试课程",
+  "category": "course",
+  "has_children": true,
+  "child_info": {
+    "children": [
+      {
+        "id": "block-v1:FIRAx+TARGET+20261113+type@chapter+block@chapter",
+        "display_name": "第一章",
+        "category": "chapter",
+        "has_children": true,
+        "child_info": {
+          "children": [
+            {
+              "id": "block-v1:FIRAx+TARGET+20261113+type@sequential+block@section",
+              "display_name": "1.2 测试",
+              "category": "sequential",
+              "has_children": true,
+              "child_info": {
+                "children": [
+                  {
+                    "id": "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unit",
+                    "display_name": "赋能内容",
+                    "category": "vertical",
+                    "has_children": true,
+                    "child_info": {
+                      "children": [
+                        {
+                          "id": "block-v1:FIRAx+TARGET+20261113+type@imagesgallery+block@gallery",
+                          "display_name": "有声幻灯片",
+                          "category": "imagesgallery",
+                          "has_children": false
+                        },
+                        {
+                          "id": "block-v1:FIRAx+TARGET+20261113+type@html+block@summary",
+                          "display_name": "本节要点",
+                          "category": "html",
+                          "has_children": false
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

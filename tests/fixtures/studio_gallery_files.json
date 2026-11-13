@@ -1,0 +1,35 @@
+{
+  "files": [
+    {
+      "id": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@1.jpg",
+      "asset_key": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@1.jpg",
+      "display_name": "1.jpg",
+      "url": "/asset-v1:FIRAx+TARGET+20261113+type@asset+block@1.jpg",
+      "content_type": "image/jpeg",
+      "file_size": 1200,
+      "external_url": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@asset+block@1.jpg",
+      "thumbnail": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@thumbnail+block@1.jpg"
+    },
+    {
+      "id": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@2.jpg",
+      "asset_key": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@2.jpg",
+      "display_name": "2.jpg",
+      "url": "/asset-v1:FIRAx+TARGET+20261113+type@asset+block@2.jpg",
+      "content_type": "image/jpeg",
+      "file_size": 1200,
+      "external_url": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@asset+block@2.jpg",
+      "thumbnail": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@thumbnail+block@2.jpg"
+    },
+    {
+      "id": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@3.jpg",
+      "asset_key": "asset-v1:FIRAx+TARGET+20261113+type@asset+block@3.jpg",
+      "display_name": "3.jpg",
+      "url": "/asset-v1:FIRAx+TARGET+20261113+type@asset+block@3.jpg",
+      "content_type": "image/jpeg",
+      "file_size": 1200,
+      "external_url": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@asset+block@3.jpg",
+      "thumbnail": "https://courses.example.test/asset-v1:FIRAx+TARGET+20261113+type@thumbnail+block@3.jpg"
+    }
+  ],
+  "total_count": 3
+}

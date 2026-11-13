@@ -12,7 +12,7 @@ import requests
 
 from scripts.production import AgentBridge, Studio, synthesize as existing_synthesizer
 from scripts.repair_one import repair_one
-from test_repair_one import GALLERY, SEQUENTIAL, Studio as FakeStudio, package_at, synthesize, write_json
+from test_repair_one import GALLERY, SEQUENTIAL, Studio as FakeStudio, fixture, package_at, synthesize, write_json
 
 
 class Response:
@@ -152,13 +152,16 @@ def test_real_adapter_detects_sibling_html_body_change_with_unchanged_concise_tr
     assert result["status"] != "success" and "changed" in result["reason"] and not state.published
 
 
-def test_real_adapter_stops_for_component_with_unobservable_content_fields(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("category", "locator", "expected"), [
+    ("video", "block-v1:FIRAx+TARGET+20261113+type@video+block@video", "type@video+block@video"),
+    ("video?token=secret", "block-v1:FIRAx+TARGET+20261113+type@video+block@video?token=secret", "unknown"),
+])
+def test_real_adapter_stops_for_component_with_unobservable_content_fields(tmp_path, monkeypatch, category, locator, expected):
     class VideoStudio(FakeStudio):
         def get_course_structure(self, course_id):
             tree = super().get_course_structure(course_id)
             unit = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
-            unit["child_info"]["children"].append({"category": "video",
-                "id": "block-v1:FIRAx+TARGET+20261113+type@video+block@video"})
+            unit["child_info"]["children"].append({"category": category, "id": locator})
             return tree
 
     package = tmp_path / "package"
@@ -171,6 +174,7 @@ def test_real_adapter_stops_for_component_with_unobservable_content_fields(tmp_p
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
     result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
     assert result["status"] == "unconfirmed"
+    assert expected in result["reason"] and "secret" not in result["reason"]
     assert not state.published and state.audios == [{"document_id": "old.mp3", "file_name": "old.mp3"}]
 
 
@@ -179,8 +183,7 @@ def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, 
         def get_course_structure(self, course_id):
             tree = super().get_course_structure(course_id)
             section = tree["child_info"]["children"][0]["child_info"]["children"][0]
-            section["child_info"]["children"].append({"category": "vertical", "has_children": True,
-                "id": "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unreadable"})
+            section["child_info"]["children"].append(fixture("studio_empty_vertical.json"))
             return tree
 
     package = tmp_path / "package"
@@ -193,6 +196,7 @@ def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, 
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
     result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
     assert result["status"] == "unconfirmed" and not state.published
+    assert "child list" in result["reason"] and "type@vertical+block@empty" in result["reason"]
 
 
 @pytest.mark.parametrize("shape", [
@@ -249,7 +253,7 @@ def test_real_adapter_rejects_ambiguous_or_contradictory_sibling_unit(tmp_path, 
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
     result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
     assert result["status"] == "unconfirmed" and result["phase"] == "target"
-    assert result["reason"] == "the sequential structure is incomplete" and not state.published
+    assert "structure is incomplete" in result["reason"] and not state.published
 
 
 def test_repair_uses_existing_tts_script_with_a_simulated_bl_boundary(tmp_path, monkeypatch):
