@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from urllib.parse import urlparse
 
 
@@ -38,7 +39,14 @@ def _write(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    for attempt in range(5):
+        try:
+            temporary.replace(path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 def _children(node):
@@ -100,13 +108,13 @@ def _load_inputs(package, section_id, repair_dir):
     return section, source_id, chapter_name, block, gallery, images, {key: audio[key] for key in keys}
 
 
-def _target(studio, course_id, chapter_name, section_title):
+def _target(studio, course_id, chapter_name, section_title, gallery_locator=None):
     root = studio.get_course_structure(course_id)
     chapter = _one([x for x in _children(root) if x.get("category") == "chapter" and x.get("display_name", "").strip() == chapter_name], "target chapter")
     sequential = _one([x for x in _children(chapter) if x.get("category") == "sequential" and x.get("display_name", "").strip() == section_title], "target sequential")
     vertical = _one([x for x in _children(sequential) if x.get("category") == "vertical" and x.get("display_name", "").strip() == "赋能内容"], "target 赋能内容")
-    gallery = _one([x for x in _children(vertical) if x.get("category") == "imagesgallery"], "target Gallery")
     locator = lambda node: node.get("id") or node.get("block_location") or node.get("locator")
+    gallery = _one([x for x in _children(vertical) if x.get("category") == "imagesgallery" and (gallery_locator is None or locator(x) == gallery_locator)], "target Gallery")
     ids = [locator(sequential), locator(vertical), locator(gallery)]
     prefix = "block-v1:" + course_id.removeprefix("course-v1:") + "+type@"
     if any(not isinstance(locator, str) or not locator.startswith(prefix + kind + "+block@") or not locator.removeprefix(prefix + kind + "+block@") for locator, kind in zip(ids, ("sequential", "vertical", "imagesgallery"))):
@@ -189,7 +197,7 @@ def _validate_audio(manifest_path, pages, audio_path):
     return [{key: item[key] for key in ("page", "start", "end", "subtitle")} for item in rows]
 
 
-def repair_one(package, target_url, section_id, repair_dir, *, split, review, synthesize, studio):
+def repair_one(package, target_url, section_id, repair_dir, *, split, review, synthesize, studio, force_replace=False):
     """Run one repair. Callbacks are isolated Agent, TTS and Studio boundaries."""
     package, repair_dir = Path(package).resolve(), Path(repair_dir).resolve()
     if not repair_dir.is_relative_to(package) or repair_dir == package:
@@ -209,6 +217,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
     output = repair_dir / section_id
     old_audio = new_audio = old_config = new_config = None
     gallery_id = None
+    replacing = False
     try:
         section, source_id, chapter_name, block, gallery, images, voice = _load_inputs(package, section_id, repair_dir)
         report["source_course_id"] = source_id
@@ -236,12 +245,14 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         if pages is None:
             raise RepairError("pagination or review did not pass")
         report["phase"] = "target"
+        if (output / "replacement-state.json").exists():
+            report["status"] = "unconfirmed"
+            raise RepairError("an earlier Gallery replacement requires reconciliation before rerunning")
         target = _target(studio, course_id, chapter_name, section["section_title"])
         sequential_id, vertical_id, gallery_id, children = target
         report.update({"sequential": sequential_id, "vertical": vertical_id, "gallery": gallery_id})
         files = _files(studio, gallery_id)
-        if [x["filename"] for x in files] != [p.name for p in images]:
-            raise RepairError("Gallery images differ; replacement path required")
+        replacing = force_replace or [x["filename"] for x in files] != [p.name for p in images]
         old_audio, old_config = _audio(studio, gallery_id), _config(studio, gallery_id)
         _write(output / "old-state.json", {"audio": old_audio, "play_config": old_config, "files": files, "children": children})
         items = []
@@ -263,22 +274,32 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files or _audio(studio, gallery_id) != old_audio or _config(studio, gallery_id) != old_config:
             raise RepairError("target changed before update")
         report["phase"] = "update"
-        new_audio = studio.upload_audio(gallery_id, audio_path)
-        if not isinstance(new_audio, dict) or not new_audio.get("document_id") or not new_audio.get("file_name") or new_audio == old_audio:
-            raise RepairError("new audio identity is missing")
-        if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files:
+        if replacing:
+            from .replacement import replace_gallery
             report["status"] = "unconfirmed"
-            raise RepairError("target changed during audio upload")
-        _replace(lambda: _audio(studio, gallery_id), lambda value: studio.bind_audio(gallery_id, value), old_audio, new_audio)
-        if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files:
-            report["status"] = "unconfirmed"
-            raise RepairError("target changed during audio binding")
-        _replace(lambda: _config(studio, gallery_id), lambda value: studio.update_play_config(gallery_id, value), old_config, new_config)
-        if _target(studio, course_id, chapter_name, section["section_title"]) != target:
-            report["status"] = "unconfirmed"
-            raise RepairError("target unit changed during update")
-        if _files(studio, gallery_id) != files or _audio(studio, gallery_id) != new_audio or _config(studio, gallery_id) != new_config:
-            raise RepairError("Gallery verification failed")
+            target, files, new_audio = replace_gallery(
+                studio, course_id, chapter_name, section["section_title"], target, files,
+                old_audio, old_config, new_config, images, audio_path, output,
+            )
+            sequential_id, vertical_id, gallery_id, children = target
+            report.update({"gallery": gallery_id, "replacement": True})
+        else:
+            new_audio = studio.upload_audio(gallery_id, audio_path)
+            if not isinstance(new_audio, dict) or not new_audio.get("document_id") or not new_audio.get("file_name") or new_audio == old_audio:
+                raise RepairError("new audio identity is missing")
+            if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files:
+                report["status"] = "unconfirmed"
+                raise RepairError("target changed during audio upload")
+            _replace(lambda: _audio(studio, gallery_id), lambda value: studio.bind_audio(gallery_id, value), old_audio, new_audio)
+            if _target(studio, course_id, chapter_name, section["section_title"]) != target or _files(studio, gallery_id) != files:
+                report["status"] = "unconfirmed"
+                raise RepairError("target changed during audio binding")
+            _replace(lambda: _config(studio, gallery_id), lambda value: studio.update_play_config(gallery_id, value), old_config, new_config)
+            if _target(studio, course_id, chapter_name, section["section_title"]) != target:
+                report["status"] = "unconfirmed"
+                raise RepairError("target unit changed during update")
+            if _files(studio, gallery_id) != files or _audio(studio, gallery_id) != new_audio or _config(studio, gallery_id) != new_config:
+                raise RepairError("Gallery verification failed")
         report["phase"] = "publish"
         report["status"] = "unconfirmed"
         for _ in range(3):
@@ -297,10 +318,21 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 raise RepairError("target changed while publication was pending")
         else:
             raise RepairError("sequential publication not confirmed")
-        report.update({"status": "success", "phase": "complete", "image_match": "filename/count/order only"})
+        report.update({"status": "success", "phase": "complete", "image_match": "isolated local uploads" if replacing else "filename/count/order only"})
     except Exception as exc:
         report["reason"] = str(exc) if isinstance(exc, RepairError) else type(exc).__name__
-        if gallery_id and old_audio and old_config and new_audio and report["phase"] == "update" and report["status"] != "unconfirmed":
+        if replacing:
+            report.update({"replacement": True, "recovery": "not attempted"})
+            state_path = output / "replacement-state.json"
+            if state_path.is_file():
+                try:
+                    state = _json(state_path)
+                    report["replacement_stage"] = state.get("stage")
+                    if state.get("new_gallery"):
+                        report["candidate_gallery"] = state["new_gallery"]
+                except (OSError, ValueError, AttributeError):
+                    report["replacement_stage"] = "unreadable"
+        if not replacing and gallery_id and old_audio and old_config and new_audio and report["phase"] == "update" and report["status"] != "unconfirmed":
             try:
                 _replace(lambda: _config(studio, gallery_id), lambda value: studio.update_play_config(gallery_id, value), new_config, old_config)
                 _replace(lambda: _audio(studio, gallery_id), lambda value: studio.bind_audio(gallery_id, value), new_audio, old_audio)

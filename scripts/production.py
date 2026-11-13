@@ -52,6 +52,32 @@ class Studio:
     def _call(self, name, context):
         return self.publisher.call_template(self.client.session, name, self.adapter[name], context, True, 60)
 
+    def create_gallery(self, vertical_id):
+        context = self._context(vertical_id)
+        context.update({"vertical_block_id": vertical_id, "imagegallery_category": "imagesgallery"})
+        self._call("create_block", context)
+        return context.get("block_locator")
+
+    def upload_image(self, gallery_id, path):
+        context = self._context(gallery_id)
+        context["image_file"] = str(Path(path).resolve())
+        return self._call("upload_image", context).get("asset_id")
+
+    def order_images(self, gallery_id, ids):
+        context = self._context(gallery_id)
+        context["uploaded_asset_ids"] = ids
+        self._call("change_files_order", context)
+
+    def reorder_children(self, vertical_id, ids):
+        context = self._context(vertical_id)
+        context.update({"vertical_block_id": vertical_id, "vertical_children_obj": ids})
+        self._call("reorder_children", context)
+
+    def delete_gallery(self, gallery_id):
+        context = self._context(gallery_id)
+        context["delete_block_locator"] = gallery_id
+        self._call("delete_block", context)
+
     def upload_audio(self, gallery_id, audio_path):
         import oss2  # noqa: F401; require the SDK before the publisher can install anything
 
