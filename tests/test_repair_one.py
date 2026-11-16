@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.repair_one import repair_one
+from scripts.repair_one import _nlm, repair_one
 
 SEQUENTIAL = "block-v1:FIRAx+TARGET+20261113+type@sequential+block@section"
 VERTICAL = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@unit"
@@ -244,6 +244,45 @@ def test_review_rejection_is_sent_back_to_splitter_on_retry(tmp_path):
     assert len(requests) == 2
     assert requests[1]["previous_pages"] == candidate
     assert requests[1]["review_feedback"] == "第 3 页与图片主题不符"
+
+
+def test_invalid_title_and_table_boundaries_are_retried_before_review(tmp_path):
+    package = tmp_path / "package"
+    package_at(package)
+    source_path = package / "course-content.json"
+    source_data = json.loads(source_path.read_text(encoding="utf-8"))
+    block = source_data["chapters"][0]["sections"][0]["verticals"][0]["blocks"][0]
+    block["text"] = ("<h1>测试</h1><h2>一、旧主题</h2><p>旧正文。</p><hr/>"
+                     "<h2>二、新主题</h2><p>新导读。</p><h3>1、表格</h3><p>对照如下：</p>"
+                     "<table><tr><th>维度</th><th>判断</th></tr><tr><td>需求</td><td>强</td></tr></table>"
+                     "<p>当你用这张表做评估，结论就能用于配置资源。</p><h3>2、下一项</h3><p>下一项正文。</p>")
+    write_json(source_path, source_data)
+    gallery_path = package / "1.2 测试" / "imagesgallery" / "imagesgallery.json"
+    gallery = json.loads(gallery_path.read_text(encoding="utf-8"))
+    gallery["items"].append({"page": 4, "image": "images/4.jpg", "speech": "旧内容"})
+    (gallery_path.parent / "images" / "4.jpg").write_bytes(b"image")
+    write_json(gallery_path, gallery)
+    common = _nlm()
+    source = common._clean_page_body(common._render_html(block["text"]))
+    body = common._remove_duplicate_cover_heading([source], title="测试")[0]
+    parent, child1, conclusion, child2 = (body.index(marker) for marker in
+        ("## 二、新主题", "### 1、表格", "当你用这张表", "### 2、下一项"))
+    bad = ["# 测试", body[:child1].strip(), body[child1:conclusion].strip(), body[conclusion:].strip()]
+    correct = ["# 测试", body[:parent].strip(), body[parent:child2].strip(), body[child2:].strip()]
+    requests, reviewed = [], []
+    def split(request):
+        requests.append(request)
+        return bad if len(requests) == 1 else correct
+    def review(request):
+        reviewed.append(request["pages"])
+        return True
+    def stop_before_audio(*args):
+        raise RuntimeError("stop after pagination")
+
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=split, review=review, synthesize=stop_before_audio, studio=Studio())
+    assert result["phase"] == "audio" and len(requests) == 2
+    assert "标题" in requests[1]["review_feedback"]
+    assert reviewed == [correct]
 
 
 def test_target_course_identity_mismatch_does_not_write(tmp_path):

@@ -38,10 +38,13 @@ def _section_chapter(package, repair_dir, title):
 
 
 def run_batch(package, target_url, repair_dir, *, studio, synthesize, split=None, review=None,
-              sections=None, chapter=None, first_chapter=False, force_replace=False, agent_factory=None):
+              sections=None, chapter=None, first_chapter=False, force_replace=False, agent_factory=None,
+              repaginate=False, pagination_feedback=None):
     package, repair_dir = Path(package).resolve(), Path(repair_dir).resolve()
     if sum((chapter is not None, sections is not None, first_chapter)) > 1:
         raise ValueError("choose one scope")
+    if pagination_feedback and (not repaginate or sections is None or len(sections) != 1):
+        raise ValueError("pagination feedback requires repagination of one explicitly selected section")
     if not repair_dir.is_relative_to(package) or repair_dir == package:
         raise ValueError("repair directory must be a dedicated child of the course package")
     marker = repair_dir / ".nlm-html-course-fixer"
@@ -74,7 +77,7 @@ def run_batch(package, target_url, repair_dir, *, studio, synthesize, split=None
             agent = agent_factory(section_id) if agent_factory else None
             result = repair_one(package, target_url, section_id, repair_dir, split=agent.split if agent else split,
                                 review=agent.review if agent else review, synthesize=synthesize, studio=studio,
-                                force_replace=force_replace)
+                                force_replace=force_replace, repaginate=repaginate, pagination_feedback=pagination_feedback)
         except Exception as exc:
             result = {"section_id": section_id, "target_url": target_url, "status": "failed",
                       "phase": "inputs", "reason": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,

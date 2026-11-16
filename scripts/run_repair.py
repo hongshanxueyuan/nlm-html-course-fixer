@@ -19,14 +19,19 @@ def main():
     parser.add_argument("--repair-dir", help="Dedicated directory inside the course package")
     parser.add_argument("--tenant-config", help="Optional Studio tenant configuration JSON")
     parser.add_argument("--force-replace", action="store_true", help="Replace Gallery when its image bytes are known to differ despite matching filenames")
+    parser.add_argument("--repaginate", action="store_true", help="Repaginate completed sections after checking their saved and live state")
+    parser.add_argument("--pagination-feedback", help="Feedback for one explicitly selected section")
     args = parser.parse_args()
+    if args.pagination_feedback and (not args.repaginate or not args.section or len(args.section) != 1):
+        parser.error("--pagination-feedback requires --repaginate and one --section")
     repair_dir = Path(args.repair_dir) if args.repair_dir else Path(args.package) / "nlm-html-course-fixer"
     tenant_config = find_tenant_config(args.studio_url, args.package, repair_dir, args.tenant_config)
     studio = Studio(args.studio_url, tenant_config)
     result = run_batch(args.package, args.studio_url, repair_dir, sections=args.section,
                        chapter=args.chapter, first_chapter=args.first_chapter, studio=studio,
                        agent_factory=lambda section: AgentBridge(repair_dir / ".agent-bridge" / section),
-                       synthesize=synthesize, force_replace=args.force_replace)
+                       synthesize=synthesize, force_replace=args.force_replace,
+                       repaginate=args.repaginate, pagination_feedback=args.pagination_feedback)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "success" else 1
 

@@ -15,6 +15,8 @@ import time
 import uuid
 from urllib.parse import urlparse
 
+from .pagination import PaginationBoundaryError, validate_boundaries
+
 
 class RepairError(Exception):
     pass
@@ -279,6 +281,16 @@ def _target_from_saved(value):
     return tuple(value[:3]) + (tuple(tuple(row) for row in value[3]), value[4])
 
 
+def _saved_artifact_paths(output, saved):
+    output = output.resolve()
+    manifest = Path(saved.get("manifest_path") or output / "imagesgallery.json").resolve()
+    audio = Path(saved.get("audio_path") or "").resolve()
+    if (not manifest.is_relative_to(output) or manifest.name != "imagesgallery.json"
+            or not audio.is_relative_to(output) or audio.suffix.lower() != ".mp3"):
+        raise RepairError("saved artifact path is outside the repair directory")
+    return manifest, audio
+
+
 def _files(studio, gallery_id):
     return _retry_read(lambda: _read_files(studio, gallery_id))
 
@@ -391,7 +403,8 @@ def _validate_audio(manifest_path, pages, audio_path):
     return [{key: item[key] for key in ("page", "start", "end", "subtitle")} for item in rows]
 
 
-def repair_one(package, target_url, section_id, repair_dir, *, split, review, synthesize, studio, force_replace=False):
+def repair_one(package, target_url, section_id, repair_dir, *, split, review, synthesize, studio, force_replace=False,
+               repaginate=False, pagination_feedback=None):
     """Run one repair. Callbacks are isolated Agent, TTS and Studio boundaries."""
     package, repair_dir = Path(package).resolve(), Path(repair_dir).resolve()
     if not repair_dir.is_relative_to(package) or repair_dir == package:
@@ -431,8 +444,16 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 raise RepairError("saved run stage is unreadable")
             if saved.get("publication_scope") != "vertical":
                 raise RepairError("saved run uses an earlier publication scope and requires reconciliation")
+            if repaginate and saved.get("stage") != "complete":
+                raise RepairError("unfinished run must be reconciled before repagination")
             saved_target = _target_from_saved(saved.get("target"))
             _publication(studio, course_id, saved_target[0], saved_target[1])
+            if repaginate:
+                saved_manifest, saved_audio = _saved_artifact_paths(output, saved)
+                if (not saved_manifest.is_file() or not saved_audio.is_file()
+                        or _sha256(saved_audio) != saved.get("audio_sha256")
+                        or _sha256(saved_manifest) != saved.get("manifest_sha256")):
+                    raise RepairError("completed artifacts changed before repagination")
             if (saved.get("stage") == "prepared" and saved.get("input_digest") != input_digest
                     and not (output / "replacement-state.json").exists()):
                 report["status"] = "unconfirmed"
@@ -452,10 +473,8 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     report["replacement"] = True
                 if saved.get("input_digest") != input_digest:
                     raise RepairError("input changed since preparation")
-                manifest_path = output / "imagesgallery.json"
-                saved_audio = Path(saved["audio_path"]).resolve()
-                if (not saved_audio.is_relative_to((output / "audio").resolve()) or not saved_audio.is_file()
-                        or not manifest_path.is_file() or _sha256(saved_audio) != saved["audio_sha256"]
+                manifest_path, saved_audio = _saved_artifact_paths(output, saved)
+                if (not saved_audio.is_file() or not manifest_path.is_file() or _sha256(saved_audio) != saved["audio_sha256"]
                         or _sha256(manifest_path) != saved["manifest_sha256"]):
                     raise RepairError("artifacts changed since preparation")
                 pages = common._normalize_explicit_page_content(saved["pages"])
@@ -505,7 +524,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                               "audio": resumed_audio, "image_match": match_description})
                 _write(state_path, saved)
                 report.update({"status": "success", "phase": "complete", "image_match": match_description,
-                               "recovery": "resumed and verified"})
+                               "recovery": "resumed and verified", "manifest_path": str(manifest_path.resolve())})
                 _write(output / "report.json", report)
                 return report
             if saved.get("stage") == "complete":
@@ -522,10 +541,8 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 prior_complete = saved
                 report["status"] = "failed"
             if saved.get("stage") == "complete" and saved.get("input_digest") == input_digest:
-                manifest_path = output / "imagesgallery.json"
-                saved_audio = Path(saved["audio_path"]).resolve()
-                if (saved_audio.is_relative_to((output / "audio").resolve())
-                        and manifest_path.is_file() and saved_audio.is_file()
+                manifest_path, saved_audio = _saved_artifact_paths(output, saved)
+                if (manifest_path.is_file() and saved_audio.is_file()
                         and _sha256(manifest_path) == saved.get("manifest_sha256")
                         and _sha256(saved_audio) == saved.get("audio_sha256")):
                     pages = common._normalize_explicit_page_content(saved["pages"])
@@ -542,21 +559,28 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                         _verify_gallery(studio, course_id, chapter_name, section["section_title"], current,
                                         saved["files"], saved["audio"], saved["config"],
                                         isolated=saved.get("isolated_images", saved.get("replacement", False)))
-                        report.update({"status": "success", "phase": "complete", "sequential": current[0],
-                                       "vertical": current[1], "gallery": current[2],
-                                       "image_match": saved["image_match"], "reused": True})
-                        if saved.get("replacement"):
-                            report["replacement"] = True
-                        _write(output / "report.json", report)
-                        return report
-                    old = _json(output / "old-state.json")
-                    if (saved.get("replacement") or json.loads(json.dumps(current[3])) != old["children"]
-                            or _files(studio, current[2]) != old["files"]
-                            or _audio(studio, current[2]) != old["audio"]
-                            or _config(studio, current[2]) != old["play_config"]):
-                        report["status"] = "unconfirmed"
-                        raise RepairError("completed section changed since its verified snapshot")
-                    report["status"] = "failed"
+                        if not repaginate:
+                            report.update({"status": "success", "phase": "complete", "sequential": current[0],
+                                           "vertical": current[1], "gallery": current[2],
+                                           "image_match": saved["image_match"], "reused": True,
+                                           "manifest_path": str(manifest_path.resolve())})
+                            if saved.get("replacement"):
+                                report["replacement"] = True
+                            _write(output / "report.json", report)
+                            return report
+                        prior_complete = saved
+                        report["status"] = "failed"
+                    else:
+                        old = _json(output / "old-state.json")
+                        if (saved.get("replacement") or json.loads(json.dumps(current[3])) != old["children"]
+                                or _files(studio, current[2]) != old["files"]
+                                or _audio(studio, current[2]) != old["audio"]
+                                or _config(studio, current[2]) != old["play_config"]):
+                            report["status"] = "unconfirmed"
+                            raise RepairError("completed section changed since its verified snapshot")
+                        if repaginate:
+                            raise RepairError("completed section is no longer published as verified")
+                        report["status"] = "failed"
                 else:
                     report["status"] = "unconfirmed"
                     current = _target(studio, course_id, chapter_name, section["section_title"])
@@ -566,6 +590,11 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     prior_complete = saved
                     report["status"] = "failed"
         request = {"source": source, "body": body, "cover_title": cover_title, "old_pages": section.get("page_content", []), "images": [str(p) for p in images], "count": len(images)}
+        if repaginate and prior_complete:
+            request["baseline_pages"] = copy.deepcopy(prior_complete["pages"])
+            request["previous_pages"] = copy.deepcopy(prior_complete["pages"])
+        if pagination_feedback:
+            request["user_feedback"] = pagination_feedback
         report["phase"] = "pagination"
         pages = None
         for _ in range(3):
@@ -575,6 +604,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     raise RepairError("incorrect page count or cover")
                 proposal = common._normalize_explicit_page_content(proposal)
                 common._validate_html_pagination_source_coverage(body, proposal[1:])
+                validate_boundaries(proposal)
                 verdict = review({**copy.deepcopy(request), "pages": copy.deepcopy(proposal)})
                 approved = verdict.get("approved") is True if isinstance(verdict, dict) else verdict is True
                 if not approved:
@@ -585,6 +615,10 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     raise RepairError("independent review rejected pages")
                 pages = proposal
                 break
+            except PaginationBoundaryError as exc:
+                request["previous_pages"] = copy.deepcopy(proposal)
+                request["review_feedback"] = str(exc)
+                continue
             except Exception:
                 continue
         if pages is None:
@@ -617,18 +651,21 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         old_audio, old_config = _audio(studio, gallery_id), _config(studio, gallery_id)
         _assert_no_credentials(old_config)
         _write(output / "old-state.json", {"audio": old_audio, "play_config": old_config, "files": files, "children": children})
+        run_output = output / "revisions" / uuid.uuid4().hex if prior_complete else output
+        if prior_complete:
+            _write(run_output / "previous-state.json", prior_complete)
         items = []
         for index, (old, image, text) in enumerate(zip(gallery["items"], images, pages), start=1):
-            item = {"page": index, "image": os.path.relpath(image, output).replace("\\", "/"), "speech": text}
+            item = {"page": index, "image": os.path.relpath(image, run_output).replace("\\", "/"), "speech": text}
             item.update({key: old[key] for key in ("voice", "voice_preset") if key in old})
             items.append(item)
         manifest = {key: value for key, value in gallery.items() if key not in {"audio", "items", "source_speech", "voice", "voice_preset"}}
         manifest["items"] = items
-        manifest_path = output / "imagesgallery.json"
+        manifest_path = run_output / "imagesgallery.json"
         _write(manifest_path, manifest)
         report["phase"] = "audio"
-        audio_path = synthesize(manifest_path, copy.deepcopy(voice), output / "audio")
-        if not Path(audio_path).resolve().is_relative_to((output / "audio").resolve()):
+        audio_path = synthesize(manifest_path, copy.deepcopy(voice), run_output / "audio")
+        if not Path(audio_path).resolve().is_relative_to((run_output / "audio").resolve()):
             raise RepairError("generated audio is outside the repair directory")
         time_config = _validate_audio(manifest_path, pages, audio_path)
         new_config = copy.deepcopy(old_config)
@@ -638,6 +675,7 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
         _write(state_path, {"stage": "prepared", "publication_scope": "vertical", "input_digest": input_digest, "target": target,
                             "files": files, "old_audio": old_audio, "old_config": old_config,
                             "config": new_config, "pages": pages, "audio_path": str(Path(audio_path).resolve()),
+                            "manifest_path": str(manifest_path.resolve()),
                             "audio_sha256": _sha256(audio_path), "manifest_sha256": _sha256(manifest_path),
                             "replacement": replacing, "isolated_images": replacing or matching_replaced_images,
                             "images": _image_digests(images), "force_replace": force_replace})
@@ -706,11 +744,11 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                 raise RepairError("target changed while publication was pending")
         else:
             raise RepairError("target unit publication not confirmed")
-        report.update({"status": "success", "phase": "complete", "image_match": "isolated local uploads" if replacing or matching_replaced_images else "filename/count/order only"})
+        report.update({"status": "success", "phase": "complete", "image_match": "isolated local uploads" if replacing or matching_replaced_images else "filename/count/order only", "manifest_path": str(manifest_path.resolve())})
         _write(state_path, {"stage": "complete", "publication_scope": "vertical", "input_digest": input_digest, "target": target,
                             "files": files, "audio": new_audio, "config": new_config, "pages": pages,
                             "audio_path": str(Path(audio_path).resolve()), "audio_sha256": _sha256(audio_path),
-                            "manifest_sha256": _sha256(manifest_path), "replacement": replacing,
+                            "manifest_path": str(manifest_path.resolve()), "manifest_sha256": _sha256(manifest_path), "replacement": replacing,
                             "image_match": report["image_match"], "isolated_images": replacing or matching_replaced_images,
                             "images": _image_digests(images),
                             "force_replace": force_replace})
