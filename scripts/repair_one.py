@@ -562,7 +562,13 @@ def repair_one(package, target_url, section_id, repair_dir, *, split, review, sy
                     raise RepairError("incorrect page count or cover")
                 proposal = common._normalize_explicit_page_content(proposal)
                 common._validate_html_pagination_source_coverage(body, proposal[1:])
-                if review({**copy.deepcopy(request), "pages": copy.deepcopy(proposal)}) is not True:
+                verdict = review({**copy.deepcopy(request), "pages": copy.deepcopy(proposal)})
+                approved = verdict.get("approved") is True if isinstance(verdict, dict) else verdict is True
+                if not approved:
+                    reason = verdict.get("reason") if isinstance(verdict, dict) else None
+                    request["previous_pages"] = copy.deepcopy(proposal)
+                    request["review_feedback"] = (reason.strip()[:1200] if isinstance(reason, str) and reason.strip()
+                                                  else "上一版未通过独立复核，请检查分页与图片主题。")
                     raise RepairError("independent review rejected pages")
                 pages = proposal
                 break

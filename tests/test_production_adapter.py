@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 import pytest
 import requests
 
+from scripts import production, run_repair
 from scripts.production import AgentBridge, Studio, synthesize as existing_synthesizer
 from scripts.repair_one import repair_one
 from test_repair_one import GALLERY, SEQUENTIAL, Studio as FakeStudio, fixture, package_at, synthesize, write_json
@@ -84,6 +86,120 @@ class Bucket:
 
     def complete_multipart_upload(self, key, upload_id, parts):
         pass
+
+
+def test_cli_reuses_tenant_config_in_existing_repair_directory(tmp_path, monkeypatch):
+    package = tmp_path / "package"
+    repair = package / "nlm-html-course-fixer"
+    tenants = repair / "tenant-config.json"
+    tenants.parent.mkdir(parents=True)
+    write_json(tenants, {"tenants": {"uat": {"studio_base": "https://studio.uat.firacademy.com"}}})
+    target = "https://studio.uat.firacademy.com/course/course-v1:FIRAx+TARGET+20261113"
+    seen = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_repair", "--package", str(package), "--studio-url", target, "--first-chapter"])
+    monkeypatch.setattr(run_repair, "Studio", lambda url, config: seen.update(url=url, config=config))
+    monkeypatch.setattr(run_repair, "run_batch", lambda *args, **kwargs: {"status": "success"})
+
+    assert run_repair.main() == 0
+    assert Path(seen["config"]).resolve() == tenants.resolve()
+
+
+def test_cli_has_known_uat_profile_without_a_user_config(tmp_path, monkeypatch):
+    package = tmp_path / "package"
+    package.mkdir()
+    target = "https://studio.uat.firacademy.com/course/course-v1:FIRAx+TARGET+20261113"
+    seen = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_repair", "--package", str(package), "--studio-url", target, "--first-chapter"])
+    monkeypatch.setattr(run_repair, "Studio", lambda url, config: seen.update(url=url, config=config))
+    monkeypatch.setattr(run_repair, "run_batch", lambda *args, **kwargs: {"status": "success"})
+
+    assert run_repair.main() == 0
+    _, _, studio, courses = production._auditor_inputs().resolve_audit_input(
+        tenant=None, course_id=None, studio_url=target, tenant_config_path=Path(seen["config"]))
+    assert (studio, courses) == ("https://studio.uat.firacademy.com", "https://courses.uat.firacademy.com")
+
+
+def test_tenant_discovery_does_not_fall_back_for_an_explicit_missing_file(tmp_path):
+    target = "https://studio.firacademy.com/course/course-v1:FIRAx+TARGET+20261113"
+    with pytest.raises(FileNotFoundError):
+        production.find_tenant_config(target, tmp_path, tmp_path / "repair", tmp_path / "missing.json")
+
+
+def test_unknown_target_host_requires_a_matching_tenant_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = "https://studio.unknown.example/course/course-v1:FIRAx+TARGET+20261113"
+    with pytest.raises(ValueError, match="tenant profile"):
+        production.find_tenant_config(target, tmp_path, tmp_path / "repair")
+
+
+def test_studio_reuses_persistent_windows_credentials_when_process_has_none(tmp_path, monkeypatch):
+    for name in production.STUDIO_AUTH_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(production, "_persistent_auth_environments", lambda: [{"FIRA_SAAS_OP_COOKIE": "csrftoken=test"}])
+    monkeypatch.setattr(requests, "Session", lambda: FakeSession(FakeStudio()))
+    tenants = tmp_path / "tenants.json"
+    write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test"}}})
+
+    studio = Studio("https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", tenants)
+
+    assert studio.client.csrf_token == "test"
+
+
+def test_process_auth_is_not_mixed_with_persistent_auth(monkeypatch):
+    for name in production.STUDIO_AUTH_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FIRA_SAAS_OP_ACCOUNT", "process-account")
+    monkeypatch.setattr(production, "_persistent_auth_environments", lambda: [{"FIRA_SAAS_OP_ACCOUNT": "other-account", "FIRA_SAAS_OP_PASSWORD": "other-password"}])
+
+    env = production._studio_auth_environment()
+    assert env["FIRA_SAAS_OP_ACCOUNT"] == "process-account"
+    assert "FIRA_SAAS_OP_PASSWORD" not in env
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows persistent environment")
+def test_windows_persistent_environment_reads_user_and_machine_scopes(monkeypatch):
+    import winreg
+
+    class Key:
+        def __init__(self, root): self.root = root
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+    values = {winreg.HKEY_CURRENT_USER: {"FIRA_SAAS_OP_ACCOUNT": "account", "FIRA_SAAS_OP_PASSWORD": "password"},
+              winreg.HKEY_LOCAL_MACHINE: {"FIRA_SAAS_OP_COOKIE": "csrftoken=machine"}}
+    monkeypatch.setattr(winreg, "OpenKey", lambda root, path: Key(root))
+    def query(handle, name):
+        if name not in values[handle.root]:
+            raise FileNotFoundError(name)
+        return values[handle.root][name], winreg.REG_SZ
+    monkeypatch.setattr(winreg, "QueryValueEx", query)
+
+    assert production._persistent_auth_environments() == [values[winreg.HKEY_CURRENT_USER], values[winreg.HKEY_LOCAL_MACHINE]]
+
+
+def test_agent_bridge_keeps_review_feedback(tmp_path, monkeypatch):
+    bridge = AgentBridge(tmp_path)
+    monkeypatch.setattr(bridge, "_call", lambda kind, request: {"approved": False, "reason": "wrong boundary"})
+    assert bridge.review({}) == {"approved": False, "reason": "wrong boundary"}
+
+
+def test_tts_subprocess_inherits_bl_config_with_script_attribution(tmp_path, monkeypatch):
+    manifest = tmp_path / "manifest.json"
+    write_json(manifest, {"audio": {"full_audio": str(tmp_path / "audio.mp3")}})
+    seen = {}
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("BAILIAN_SKILL_NAME", "unrelated")
+    monkeypatch.setattr(production.subprocess, "run", lambda args, **kwargs: seen.update(kwargs))
+
+    result = existing_synthesizer(manifest, {"voice": "voice", "model": "model", "rate": 1.1, "gap_seconds_between_segments": 1}, tmp_path)
+
+    assert result == tmp_path / "audio.mp3"
+    assert seen["env"]["DASHSCOPE_API_KEY"] == "test-key"
+    assert seen["env"]["BAILIAN_CALLER_TYPE"] == "script"
+    assert seen["env"]["BAILIAN_CALLER_NAME"] == "codex"
+    assert "BAILIAN_SKILL_NAME" not in seen["env"]
 
 
 def test_repair_uses_existing_studio_adapter_against_simulated_http_and_oss(tmp_path, monkeypatch):

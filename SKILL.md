@@ -10,19 +10,21 @@ disable-model-invocation: true
 
 ## 准备
 
-1. 找到 `nlm-course-slides`、`ppt-to-imagesgallery`、`nlm-course-auditor` 和 `studio-imagegallery-publish` 的本地 checkout；通过同级目录或环境变量 `NLM_COURSE_SLIDES_ROOT`、`PPT_TO_IMAGESGALLERY_ROOT`、`NLM_COURSE_AUDITOR_ROOT`、`STUDIO_IMAGEGALLERY_PUBLISH_ROOT` 指定。可用 Python、`markdownify`、`requests`、`bl`、`ffmpeg`、`ffprobe` 和 OSS SDK；Studio tenant 配置须唯一匹配目标 URL，认证用现有环境变量，不写入产物。
-2. 读取现有 `bailian-protocol`，完成其版本与鉴权预检。沿用课程原有的百炼 TTS 配置；正式运行中使用用户已选定的修复范围，不插入逐页审核关卡。
+1. 找到 `nlm-course-slides`、`ppt-to-imagesgallery`、`nlm-course-auditor` 和 `studio-imagegallery-publish` 的本地 checkout；通过同级目录或环境变量 `NLM_COURSE_SLIDES_ROOT`、`PPT_TO_IMAGESGALLERY_ROOT`、`NLM_COURSE_AUDITOR_ROOT`、`STUDIO_IMAGEGALLERY_PUBLISH_ROOT` 指定。需要 Python、`markdownify`、`requests`、`bl`、`ffmpeg`、`ffprobe` 和 OSS SDK。
+2. 复用现有 Studio 认证及百炼 `bl` 配置。源 Gallery 的配音是已有百炼工作流：沿用原音色、模型、语速和已登录账号，用户启动修复后直接执行，不重复询问服务商或主动升级全局工具。认证、依赖或配置确实不可用时报告具体失败；不要请求用户把凭证发到聊天中。
 3. 在课程包下选一个专用空目录作为 `--repair-dir`；省略时使用课程包下的 `nlm-html-course-fixer`。续跑使用同一目录。原课程包文件只读；所有产物、模型交接和报告存入该目录。若目标、来源或声音配置不能唯一确定，报告失败，不猜测。
+
+Studio 租户配置按顺序使用：显式 `--tenant-config`、当前目录、修复目录、课程包根目录下匹配目标的 `tenant-config.json`，最后使用内置的 FIRA 主站和 UAT 映射。其他目标需已有匹配配置。认证优先使用当前进程的 `FIRA_SAAS_OP_*` 变量；Windows 进程未继承认证时，程序复用用户或机器环境中已有的整组配置。认证值不会写入产物。
 
 ## 执行
 
 在本 skill 根目录启动下面的命令（将尖括号替换为实际路径和输入），保留进程并读取其标准输出：
 
 ```text
-python -m scripts.run_repair --package <课程包> --studio-url <目标课程URL> --first-chapter --tenant-config <Studio租户配置JSON>
+python -m scripts.run_repair --package <课程包> --studio-url <目标课程URL> --first-chapter
 ```
 
-首章以外的用户选定范围使用 `--chapter <章节完整名称>` 或一个或多个 `--section <小节ID>`；用户明确选择整课时省略范围参数。按用户范围执行，不自行扩大。程序串行处理小节，同一时间最多一个切分或复核请求。程序输出 `agent_request` 后，按 [隔离子 Agent 交接](references/agent-bridge.md) 启动新的隔离子 Agent（`fork_turns=none`），等它原子写入响应，再继续读取进程输出。切分与复核分别由不同的 Agent 执行，每次重试创建新的 Agent。
+首章以外的用户选定范围使用 `--chapter <章节完整名称>` 或一个或多个 `--section <小节ID>`；用户明确选择整课时省略范围参数。按用户范围执行，不自行扩大。程序串行处理小节，同一时间最多一个切分或复核请求。程序输出 `agent_request` 后，按 [子 Agent 交接](references/agent-bridge.md) 分别交给切分和复核 Agent，等它原子写入响应，再继续读取进程输出。沿用两个不同角色的 Agent 处理后续小节和重试，不按批次累计 Agent 数量中断。
 
 程序确认固定图数、连续页码、原文覆盖和独立复核后，使用修复清单重新合成全部页面，验证 MP3 和时间轴，再对实际 Gallery 的图片元数据、音频身份、完整播放设置及小节状态逐项回读。同名同序且数量一致时原位更新；该比较不证明图片字节相同。若已知同名图片内容不一致，在命令末尾加 `--force-replace`。图片不一致时先用隔离名称上传本地图，完整回读新 Gallery 后替换旧 Gallery，保留其他组件及顺序。写入异常先回读对账；无法安全确认或恢复时不发布并报告实际状态。创建响应未提供新 Gallery 身份时，即使线上出现新块也不能认定归属，报告未确认。读后写检查并非原子锁，无法排除检查后的并发变化。
 

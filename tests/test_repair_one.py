@@ -129,6 +129,30 @@ def test_single_section_repairs_original_text_and_publishes_in_place(tmp_path):
     assert all((package / "repair" / "1.2" / item["image"]).resolve().is_file() for item in output["items"])
 
 
+def test_review_rejection_is_sent_back_to_splitter_on_retry(tmp_path):
+    package = tmp_path / "package"
+    package_at(package)
+    studio = Studio()
+    requests = []
+    candidate = ["# 测试", "第一段。", "第二段。"]
+
+    def split(request):
+        requests.append(request)
+        return candidate
+
+    def review(request):
+        if len(requests) == 1:
+            return {"approved": False, "reason": "第 3 页与图片主题不符"}
+        return {"approved": True}
+
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=split, review=review, synthesize=synthesize, studio=studio)
+
+    assert result["status"] == "success" and studio.published
+    assert len(requests) == 2
+    assert requests[1]["previous_pages"] == candidate
+    assert requests[1]["review_feedback"] == "第 3 页与图片主题不符"
+
+
 def test_target_course_identity_mismatch_does_not_write(tmp_path):
     package = tmp_path / "package"
     package_at(package)

@@ -27,15 +27,83 @@ def _module(name, path, *, package=False):
     return module
 
 
+STUDIO_AUTH_VARS = ("FIRA_SAAS_OP_ACCOUNT", "FIRA_SAAS_OP_PASSWORD", "FIRA_SAAS_OP_COOKIE", "FIRA_SAAS_OP_CSRF_TOKEN")
+
+
+def _auditor_inputs():
+    auditor = _root("NLM_COURSE_AUDITOR_ROOT", "nlm-course-auditor")
+    _module("fixer_auditor", auditor / "scripts" / "__init__.py", package=True)
+    return importlib.import_module("fixer_auditor.inputs")
+
+
+def find_tenant_config(target_url, package, repair_dir, explicit=None):
+    """Reuse a matching auditor config, falling back to known FIRA hosts."""
+    if explicit:
+        candidate = Path(explicit).expanduser().resolve()
+        if not candidate.is_file():
+            raise FileNotFoundError("Explicit tenant configuration does not exist")
+        return candidate
+    inputs = _auditor_inputs()
+    candidates = [Path.cwd() / "tenant-config.json", Path(repair_dir) / "tenant-config.json",
+                  Path(package) / "tenant-config.json", Path(__file__).resolve().parents[1] / "references" / "tenant-config.json"]
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            inputs.resolve_audit_input(tenant=None, course_id=None, studio_url=target_url,
+                                       tenant_config_path=candidate.resolve())
+        except inputs.AuditError as exc:
+            if str(exc) == "Studio URL host does not match a configured tenant profile.":
+                continue
+            raise
+        return candidate.resolve()
+    raise ValueError("Studio URL host does not match an available tenant profile; supply --tenant-config")
+
+
+def _persistent_auth_environments():
+    """Read the existing Windows user/machine environment without exposing values."""
+    if os.name != "nt":
+        return []
+    import winreg
+
+    environments = []
+    for root, key in ((winreg.HKEY_CURRENT_USER, r"Environment"),
+                      (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+        values = {}
+        try:
+            with winreg.OpenKey(root, key) as handle:
+                for name in STUDIO_AUTH_VARS:
+                    try:
+                        value, _ = winreg.QueryValueEx(handle, name)
+                    except FileNotFoundError:
+                        continue
+                    if isinstance(value, str) and value.strip():
+                        values[name] = value
+        except OSError:
+            pass
+        environments.append(values)
+    return environments
+
+
+def _studio_auth_environment():
+    env = os.environ.copy()
+    if any(env.get(name, "").strip() for name in STUDIO_AUTH_VARS):
+        return env
+    for values in _persistent_auth_environments():
+        if any(values.get(name, "").strip() for name in STUDIO_AUTH_VARS):
+            env.update({name: values[name] for name in STUDIO_AUTH_VARS if values.get(name, "").strip()})
+            break
+    return env
+
+
 class Studio:
     def __init__(self, target_url, tenant_config):
-        auditor = _root("NLM_COURSE_AUDITOR_ROOT", "nlm-course-auditor")
-        _module("fixer_auditor", auditor / "scripts" / "__init__.py", package=True)
-        inputs = importlib.import_module("fixer_auditor.inputs")
+        inputs = _auditor_inputs()
         studio = importlib.import_module("fixer_auditor.studio")
         self.audit = importlib.import_module("fixer_auditor.audit")
         _, self.course_id, self.base, courses = inputs.resolve_audit_input(tenant=None, course_id=None, studio_url=target_url, tenant_config_path=Path(tenant_config).resolve())
-        self.client = studio.StudioApiClient(studio_base=self.base, courses_base=courses, course_id=self.course_id)
+        self.client = studio.StudioApiClient(studio_base=self.base, courses_base=courses, course_id=self.course_id,
+                                             environ=_studio_auth_environment())
         publisher_root = _root("STUDIO_IMAGEGALLERY_PUBLISH_ROOT", "studio-imagegallery-publish")
         self.publisher = _module("fixer_publisher", publisher_root / "scripts" / "publish_imagegallery_block.py")
         self.adapter = self.publisher.load_adapter(str(publisher_root / "references" / "adapter.template.json"))
@@ -117,9 +185,13 @@ class Studio:
 def synthesize(manifest, voice, output):
     root = _root("PPT_TO_IMAGESGALLERY_ROOT", "ppt-to-imagesgallery")
     script = root / "scripts" / "synthesize_imagesgallery_audio.py"
+    env = os.environ.copy()
+    env.update({"BAILIAN_CALLER_TYPE": "script", "BAILIAN_CALLER_NAME": "codex"})
+    env.pop("BAILIAN_SKILL_NAME", None)
+    env.pop("BAILIAN_SKILL_VERSION", None)
     subprocess.run([sys.executable, str(script), "--manifest", str(manifest), "--out-dir", str(output),
                     "--voice", voice["voice"], "--model", voice["model"], "--rate", str(voice["rate"]),
-                    "--gap-seconds", str(voice["gap_seconds_between_segments"])], check=True, capture_output=True)
+                    "--gap-seconds", str(voice["gap_seconds_between_segments"])], check=True, capture_output=True, env=env)
     data = json.loads(Path(manifest).read_text(encoding="utf-8"))
     return Path(data["audio"]["full_audio"])
 
@@ -148,4 +220,4 @@ class AgentBridge:
         return self._call("split", request).get("pages")
 
     def review(self, request):
-        return self._call("review", request).get("approved") is True
+        return self._call("review", request)
