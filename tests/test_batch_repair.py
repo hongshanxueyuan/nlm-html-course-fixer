@@ -12,6 +12,31 @@ from test_gallery_replacement import ReplacementStudio, GALLERY, NEW_GALLERY
 TARGET = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
 
 
+def test_default_scope_processes_html_sections_from_all_chapters(tmp_path, monkeypatch):
+    package = tmp_path / "package"
+    package_at(package)
+    manifest_path = package / "section-list.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sections"].extend([
+        {"section_id": "1.3", "section_title": "第一章另一节", "block_type": "html"},
+        {"section_id": "2.1", "section_title": "第二章", "block_type": "html"},
+        {"section_id": "2.2", "section_title": "视频", "block_type": "video"},
+    ])
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    selected = []
+    def repair(package, target, section_id, repair_dir, **kwargs):
+        selected.append(section_id)
+        return {"section_id": section_id, "status": "success"}
+    monkeypatch.setattr("scripts.batch_repair.repair_one", repair)
+
+    report = run_batch(package, TARGET, package / "repair", studio=object(),
+                       split=lambda request: [], review=lambda request: True, synthesize=synthesize)
+
+    assert report["scope"] == {"course": True}
+    assert selected == ["1.2", "1.3", "2.1"]
+    assert [item["section_id"] for item in report["sections"]] == selected
+
+
 def test_batch_repairs_selected_section_and_reports_range(tmp_path):
     package = tmp_path / "package"
     package_at(package)
