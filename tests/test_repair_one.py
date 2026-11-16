@@ -3,6 +3,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from scripts.repair_one import repair_one
 
 SEQUENTIAL = "block-v1:FIRAx+TARGET+20261113+type@sequential+block@section"
@@ -79,11 +81,14 @@ class Studio:
     def update_play_config(self, locator, config):
         self.config = copy.deepcopy(config)
 
-    def publish_sequential(self, locator):
+    def publish_vertical(self, locator):
+        assert "+type@vertical+block@" in locator
         self.published = True
 
     def get_course_publication_structure(self, course_id):
-        return {SEQUENTIAL: {"published": self.published, "has_changes": not self.published}}
+        return {SEQUENTIAL: {"published": True, "has_changes": not self.published, "child_info": {"children": [
+            {"category": "vertical", "id": VERTICAL, "published": self.published, "has_changes": not self.published}
+        ]}}}
 
 
 def synthesize(manifest, voice, output, expected_pages=None):
@@ -127,6 +132,94 @@ def test_single_section_repairs_original_text_and_publishes_in_place(tmp_path):
     assert all((package / path).read_bytes() == data for path, data in original.items())
     output = json.loads((package / "repair" / "1.2" / "imagesgallery.json").read_text(encoding="utf-8"))
     assert all((package / "repair" / "1.2" / item["image"]).resolve().is_file() for item in output["items"])
+
+
+def test_repairs_and_publishes_only_target_unit_when_sibling_has_discussion(tmp_path):
+    discussion = "block-v1:FIRAx+TARGET+20261113+type@discussion+block@discussion"
+    sibling = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@training"
+
+    class UnitStudio(Studio):
+        def __init__(self):
+            super().__init__()
+            self.publications = []
+            self.reads = []
+
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            section = tree["child_info"]["children"][0]["child_info"]["children"][0]
+            section["child_info"]["children"].append({"category": "vertical", "id": sibling, "display_name": "在线训战",
+                "child_info": {"children": [{"category": "discussion", "id": discussion}]}})
+            return tree
+
+        def get_block_details(self, locator):
+            self.reads.append(locator)
+            return super().get_block_details(locator)
+
+        def publish_vertical(self, locator):
+            self.publications.append(locator)
+            self.published = True
+
+        def publish_sequential(self, locator):
+            self.publications.append(locator)
+            raise AssertionError("the sibling must not be published")
+
+        def get_course_publication_structure(self, course_id):
+            return {SEQUENTIAL: {"published": True, "has_changes": True, "child_info": {"children": [
+                {"category": "vertical", "id": VERTICAL, "published": self.published, "has_changes": not self.published},
+                {"category": "vertical", "id": sibling, "published": True, "has_changes": True},
+            ]}}}
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = UnitStudio()
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=studio)
+
+    assert result["status"] == "success"
+    assert studio.publications == [VERTICAL]
+    assert discussion not in studio.reads and sibling not in studio.reads
+    assert studio.get_course_publication_structure("unused")[SEQUENTIAL]["has_changes"] is True
+
+
+def test_unknown_component_inside_target_unit_still_blocks_publication(tmp_path):
+    class TargetDiscussion(Studio):
+        def get_course_structure(self, course_id):
+            tree = super().get_course_structure(course_id)
+            vertical = tree["child_info"]["children"][0]["child_info"]["children"][0]["child_info"]["children"][0]
+            vertical["child_info"]["children"].append({"category": "discussion", "id": "block-v1:FIRAx+TARGET+20261113+type@discussion+block@inside"})
+            return tree
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = TargetDiscussion()
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=studio)
+    assert result["status"] == "unconfirmed" and "discussion" in result["reason"]
+    assert not studio.published
+
+
+@pytest.mark.parametrize("failure", ["unpublished_parent", "missing_unit", "duplicate_unit", "missing_status"])
+def test_missing_or_ambiguous_unit_publication_state_blocks_before_audio(tmp_path, failure):
+    class IncompletePublication(Studio):
+        def get_course_publication_structure(self, course_id):
+            result = super().get_course_publication_structure(course_id)
+            section = result[SEQUENTIAL]
+            units = section["child_info"]["children"]
+            if failure == "unpublished_parent":
+                section["published"] = False
+            elif failure == "missing_unit":
+                units.clear()
+            elif failure == "duplicate_unit":
+                units.append(copy.deepcopy(units[0]))
+            else:
+                del units[0]["has_changes"]
+            return result
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = IncompletePublication()
+    generated = []
+    result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=lambda *args: generated.append(True), studio=studio)
+    assert result["status"] == "unconfirmed" and result["phase"] == "target"
+    assert not generated and not studio.published and studio.audios == [{"document_id": "old.mp3", "file_name": "old.mp3"}]
 
 
 def test_review_rejection_is_sent_back_to_splitter_on_retry(tmp_path):
@@ -224,7 +317,7 @@ def test_changed_unit_is_not_published_after_update(tmp_path):
     assert not studio.published
 
 
-def test_new_sibling_unit_during_audio_generation_is_not_published(tmp_path):
+def test_new_sibling_unit_during_audio_generation_does_not_block_target(tmp_path):
     class ChangedSectionStudio(Studio):
         changed = False
 
@@ -248,8 +341,7 @@ def test_new_sibling_unit_during_audio_generation_is_not_published(tmp_path):
         return audio
 
     result = repair_one(package, "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113", "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=studio)
-    assert result["status"] != "success"
-    assert not studio.published
+    assert result["status"] == "success" and studio.published
 
 
 def test_transient_target_structure_read_is_retried_before_writing(tmp_path):

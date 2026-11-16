@@ -473,9 +473,9 @@ def test_lost_publication_response_is_confirmed_by_readback(tmp_path):
             super().__init__()
             self.publishes = 0
 
-        def publish_sequential(self, locator):
+        def publish_vertical(self, locator):
             self.publishes += 1
-            super().publish_sequential(locator)
+            super().publish_vertical(locator)
             raise TimeoutError("published but response lost")
 
     package = tmp_path / "package"

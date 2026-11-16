@@ -36,9 +36,9 @@ def test_rerun_verifies_completed_section_without_regenerating_or_republishing(t
             self.uploads += 1
             return super().upload_audio(locator, audio)
 
-        def publish_sequential(self, locator):
+        def publish_vertical(self, locator):
             self.publications += 1
-            return super().publish_sequential(locator)
+            return super().publish_vertical(locator)
 
     package = tmp_path / "package"
     package_at(package)
@@ -126,9 +126,9 @@ def test_in_place_publication_response_interruption_is_confirmed_on_rerun(tmp_pa
         def __init__(self):
             super().__init__()
             self.publications = 0
-        def publish_sequential(self, locator):
+        def publish_vertical(self, locator):
             self.publications += 1
-            super().publish_sequential(locator)
+            super().publish_vertical(locator)
             raise SystemExit("process stopped")
 
     package = tmp_path / "package"
@@ -144,20 +144,49 @@ def test_in_place_publication_response_interruption_is_confirmed_on_rerun(tmp_pa
     assert studio.publications == 1
 
 
+def test_legacy_sequential_checkpoint_is_not_resumed_with_unit_scope(tmp_path):
+    class InterruptedStudio(Studio):
+        def __init__(self):
+            super().__init__()
+            self.publications = 0
+
+        def publish_vertical(self, locator):
+            self.publications += 1
+            raise SystemExit("interrupted before publication")
+
+    package = tmp_path / "package"
+    package_at(package)
+    studio = InterruptedStudio()
+    options = dict(sections=["1.2"], studio=studio,
+                   split=lambda request: ["# 测试", "第一段。", "第二段。"],
+                   review=lambda request: True, synthesize=synthesize)
+    with pytest.raises(SystemExit):
+        run_batch(package, TARGET, package / "repair", **options)
+    state_path = package / "repair" / "1.2" / "run-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state.pop("publication_scope")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    report = run_batch(package, TARGET, package / "repair", **options)
+    assert report["sections"][0]["status"] == "unconfirmed"
+    assert "earlier publication scope" in report["sections"][0]["reason"]
+    assert studio.publications == 1
+
+
 def test_resume_rechecks_gallery_before_retrying_publication(tmp_path):
     class ConcurrentStudio(Studio):
         def __init__(self):
             super().__init__()
             self.attempts = 0
 
-        def publish_sequential(self, locator):
+        def publish_vertical(self, locator):
             self.attempts += 1
             if self.attempts == 1:
                 raise SystemExit("interrupted before publication")
             if self.attempts == 2:
                 self.config["unrelated_setting"] = "concurrent edit"
                 raise TimeoutError("response lost")
-            return super().publish_sequential(locator)
+            return super().publish_vertical(locator)
 
     package = tmp_path / "package"
     package_at(package)
@@ -629,7 +658,7 @@ def test_batch_keeps_agent_requests_isolated_and_serial(tmp_path):
             chapter["child_info"]["children"].append(new_section)
             return tree
         def select(self, locator):
-            return self.second if locator in (second_gallery_id, second_sequential) else self.first
+            return self.second if locator in (second_gallery_id, second_sequential, second_vertical) else self.first
         def get_block_details(self, locator): return self.first.get_block_details(locator)
         def get_files(self, locator): return self.select(locator).get_files(locator)
         def get_audios(self, locator): return self.select(locator).get_audios(locator)
@@ -637,10 +666,12 @@ def test_batch_keeps_agent_requests_isolated_and_serial(tmp_path):
         def upload_audio(self, locator, path): return self.select(locator).upload_audio(locator, path)
         def bind_audio(self, locator, value): return self.select(locator).bind_audio(locator, value)
         def update_play_config(self, locator, value): return self.select(locator).update_play_config(locator, value)
-        def publish_sequential(self, locator): return self.select(locator).publish_sequential(locator)
+        def publish_vertical(self, locator): return self.select(locator).publish_vertical(locator)
         def get_course_publication_structure(self, course_id):
-            return {SEQUENTIAL: {"published": self.first.published, "has_changes": not self.first.published},
-                    second_sequential: {"published": self.second.published, "has_changes": not self.second.published}}
+            return {SEQUENTIAL: {"published": True, "has_changes": not self.first.published, "child_info": {"children": [
+                        {"category": "vertical", "id": VERTICAL, "published": self.first.published, "has_changes": not self.first.published}]}},
+                    second_sequential: {"published": True, "has_changes": not self.second.published, "child_info": {"children": [
+                        {"category": "vertical", "id": second_vertical, "published": self.second.published, "has_changes": not self.second.published}]}}}
 
     active = 0
     maximum = 0

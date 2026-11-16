@@ -13,8 +13,8 @@ import requests
 
 from scripts import production, run_repair
 from scripts.production import AgentBridge, Studio, synthesize as existing_synthesizer
-from scripts.repair_one import repair_one
-from test_repair_one import GALLERY, SEQUENTIAL, Studio as FakeStudio, fixture, package_at, synthesize, write_json
+from scripts.repair_one import _target, repair_one
+from test_repair_one import GALLERY, SEQUENTIAL, VERTICAL, Studio as FakeStudio, fixture, package_at, synthesize, write_json
 
 
 class Response:
@@ -43,7 +43,10 @@ class FakeSession:
             return Response(self.state.get_course_structure("unused"))
         tree = self.state.get_course_structure("unused")
         section = tree["child_info"]["children"][0]["child_info"]["children"][0]
-        section.update({"published": self.state.published, "has_changes": not self.state.published})
+        section.update({"published": True, "has_changes": not self.state.published})
+        for vertical in section["child_info"]["children"]:
+            if vertical.get("id") == VERTICAL:
+                vertical.update({"published": self.state.published, "has_changes": not self.state.published})
         return Response(tree)
 
     def post(self, url, **kwargs):
@@ -68,8 +71,8 @@ class FakeSession:
         if path.endswith("/update_play_config"):
             self.state.update_play_config(GALLERY, body["play_config"])
             return Response({})
-        if path.endswith(SEQUENTIAL):
-            self.state.publish_sequential(SEQUENTIAL)
+        if path.endswith(VERTICAL):
+            self.state.publish_vertical(VERTICAL)
             return Response({})
         raise AssertionError(f"unexpected network operation {method} {path}")
 
@@ -222,7 +225,7 @@ def test_repair_uses_existing_studio_adapter_against_simulated_http_and_oss(tmp_
     assert [row["subtitle"] for row in state.config["time_config"]] == ["# 测试", "第一段。", "第二段。"]
 
 
-def test_real_adapter_detects_sibling_html_body_change_with_unchanged_concise_tree(tmp_path, monkeypatch):
+def test_real_adapter_ignores_sibling_html_body_change(tmp_path, monkeypatch):
     summary = "block-v1:FIRAx+TARGET+20261113+type@html+block@other_summary"
     sibling = "block-v1:FIRAx+TARGET+20261113+type@vertical+block@other_unit"
 
@@ -265,7 +268,7 @@ def test_real_adapter_detects_sibling_html_body_change_with_unchanged_concise_tr
         return audio
 
     result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=concurrent_synthesis, studio=Studio(target, tenants))
-    assert result["status"] != "success" and "changed" in result["reason"] and not state.published
+    assert result["status"] == "success" and state.published
 
 
 @pytest.mark.parametrize(("category", "locator", "expected"), [
@@ -294,7 +297,7 @@ def test_real_adapter_stops_for_component_with_unobservable_content_fields(tmp_p
     assert not state.published and state.audios == [{"document_id": "old.mp3", "file_name": "old.mp3"}]
 
 
-def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, monkeypatch):
+def test_real_adapter_ignores_unreadable_sibling_unit_children(tmp_path, monkeypatch):
     class IncompleteStudio(FakeStudio):
         def get_course_structure(self, course_id):
             tree = super().get_course_structure(course_id)
@@ -310,9 +313,8 @@ def test_real_adapter_stops_if_sibling_unit_children_are_not_readable(tmp_path, 
     tenants = tmp_path / "tenants.json"
     write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
-    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
-    assert result["status"] == "unconfirmed" and not state.published
-    assert "child list" in result["reason"] and "type@vertical+block@empty" in result["reason"]
+    result = _target(Studio(target, tenants), "course-v1:FIRAx+TARGET+20261113", "第一章", "1.2 测试")
+    assert result[:3] == (SEQUENTIAL, VERTICAL, GALLERY) and not state.published
 
 
 @pytest.mark.parametrize("shape", [
@@ -350,7 +352,7 @@ def test_real_adapter_accepts_explicitly_empty_sibling_unit(tmp_path, monkeypatc
     {"has_children": "false"},
     {},
 ])
-def test_real_adapter_rejects_ambiguous_or_contradictory_sibling_unit(tmp_path, monkeypatch, shape):
+def test_real_adapter_ignores_ambiguous_sibling_unit(tmp_path, monkeypatch, shape):
     class AmbiguousStudio(FakeStudio):
         def get_course_structure(self, course_id):
             tree = super().get_course_structure(course_id)
@@ -367,9 +369,8 @@ def test_real_adapter_rejects_ambiguous_or_contradictory_sibling_unit(tmp_path, 
     tenants = tmp_path / "tenants.json"
     write_json(tenants, {"tenants": {"test": {"studio_base": "https://studio.example.test", "courses_base": "https://courses.example.test"}}})
     target = "https://studio.example.test/course/course-v1:FIRAx+TARGET+20261113"
-    result = repair_one(package, target, "1.2", package / "repair", split=lambda request: ["# 测试", "第一段。", "第二段。"], review=lambda request: True, synthesize=synthesize, studio=Studio(target, tenants))
-    assert result["status"] == "unconfirmed" and result["phase"] == "target"
-    assert "structure is incomplete" in result["reason"] and not state.published
+    result = _target(Studio(target, tenants), "course-v1:FIRAx+TARGET+20261113", "第一章", "1.2 测试")
+    assert result[:3] == (SEQUENTIAL, VERTICAL, GALLERY) and not state.published
 
 
 def test_repair_uses_existing_tts_script_with_a_simulated_bl_boundary(tmp_path, monkeypatch):

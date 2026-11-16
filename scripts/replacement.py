@@ -11,7 +11,7 @@ from .image_upload import check_candidate_metadata, confirm_empty_gallery, uploa
 
 
 def replace_gallery(studio, course_id, chapter, section, target, old_files, old_audio, old_config, new_config, images, audio_path, output):
-    sequential, vertical, old_gallery, baseline, sibling_snapshot = target
+    sequential, vertical, old_gallery, baseline, unit_snapshot = target
     state_path = output / "replacement-state.json"
     image_map_path = output / "image-map.json"
     copies = output / "isolated-images"
@@ -47,13 +47,13 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
         raise RepairError("new Gallery creation identity is unconfirmed")
     current_children = current[3]
     additions = [child for child in current_children if child not in baseline]
-    if (current[:3] != target[:3] or current[4] != sibling_snapshot or len(additions) != 1 or additions[0][0] != "imagesgallery"
+    if (current[:3] != target[:3] or current[4] != unit_snapshot or len(additions) != 1 or additions[0][0] != "imagesgallery"
             or tuple(child for child in current_children if child != additions[0]) != baseline
             or returned != additions[0][1]):
         raise RepairError("new Gallery creation could not be reconciled")
     new_gallery = additions[0][1]
     created_target = _target(studio, course_id, chapter, section, new_gallery)
-    if created_target[:2] != target[:2] or created_target[3] != current_children or created_target[4] != sibling_snapshot:
+    if created_target[:2] != target[:2] or created_target[3] != current_children or created_target[4] != unit_snapshot:
         raise RepairError("new Gallery identity could not be confirmed")
     initial_config = confirm_empty_gallery(studio, new_gallery)
     state.update({"stage": "created", "new_gallery": new_gallery, "created_children": current_children,
@@ -62,7 +62,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
 
     def check_original(expected_children, *, expected_files=None, expected_audios=None, expected_config=None):
         current = original_target()
-        if (current[:3] != target[:3] or current[3] != expected_children or current[4] != sibling_snapshot
+        if (current[:3] != target[:3] or current[3] != expected_children or current[4] != unit_snapshot
                 or _files(studio, old_gallery) != old_files or _audio(studio, old_gallery) != old_audio
                 or _config(studio, old_gallery) != old_config):
             raise RepairError("original Gallery or unit changed during replacement")
@@ -142,7 +142,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     moved = tuple(moved)
     def children():
         observed = _target(studio, course_id, chapter, section, new_gallery)
-        if observed[:2] != target[:2] or observed[4] != sibling_snapshot:
+        if observed[:2] != target[:2] or observed[4] != unit_snapshot:
             raise RepairError("target unit identity changed")
         return observed[3]
 
@@ -157,7 +157,7 @@ def replace_gallery(studio, course_id, chapter, section, target, old_files, old_
     _write(state_path, state)
     _replace(children, lambda value: studio.delete_gallery(old_gallery), moved, final_children)
     final_target = _target(studio, course_id, chapter, section)
-    if final_target[:2] != (sequential, vertical) or final_target[2] != new_gallery or final_target[3] != final_children or final_target[4] != sibling_snapshot:
+    if final_target[:2] != (sequential, vertical) or final_target[2] != new_gallery or final_target[3] != final_children or final_target[4] != unit_snapshot:
         raise RepairError("replacement structure could not be confirmed")
     if _files(studio, new_gallery) != desired_files or _audio(studio, new_gallery) != new_audio or _config(studio, new_gallery) != new_config:
         raise RepairError("replacement Gallery changed after deletion")
